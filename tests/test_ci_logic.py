@@ -392,6 +392,18 @@ def test_sequence_green_only_when_otherwise_empty():
 def test_sequence_empty_when_nothing_and_green_off():
     assert build_overlay_sequence([RepoState("o/r", [], [])], running_present=False, quota_frames=[], show_green=False) == []
 
+def test_sequence_orders_all_failures_before_all_stuck_across_repos():
+    states = [
+        RepoState("o/a", [FailingRun("fa", "#1")], [FailingRun("sa", "#2")]),
+        RepoState("o/b", [FailingRun("fb", "#3")], [FailingRun("sb", "#4")]),
+    ]
+    seq = build_overlay_sequence(states, running_present=False, quota_frames=[], show_green=False)
+    assert [d["kind"] for d in seq] == [
+        OVERLAY_FRAME_FAIL, OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK, OVERLAY_FRAME_STUCK]
+    # both failures (both repos) precede both stuck (both repos)
+    assert [(d["repo"], d["run"].workflow) for d in seq] == [
+        ("o/a", "fa"), ("o/b", "fb"), ("o/a", "sa"), ("o/b", "sb")]
+
 
 # --- headroom color thresholds (boundaries 50/20) -------------------------------
 
@@ -636,3 +648,4 @@ def test_led_off_elements_is_single_expiring_placeholder():
     el = LED_OFF_ELEMENTS[0]
     assert el["type"] == "rectangle" and el["width"] == 1 and el["height"] == 1
     assert el["fill_colors"] == ["#00000000"] and el["timeout"] == 5
+    assert el["border_width"] == 0

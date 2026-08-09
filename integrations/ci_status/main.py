@@ -164,7 +164,6 @@ def run_once(client, poller, cfg: dict, now: datetime,
     discipline as `frame_index`/`last_dwell_end`.
     """
     c = cfg["ci_status"]
-    timeout_s = int(c["poll_seconds"] * 1.5)
 
     if repo_cache is not None:
         account_repos = (_refresh_account_repos(poller, repo_cache, now,
