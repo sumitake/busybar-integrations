@@ -13,13 +13,13 @@ from datetime import datetime, timedelta, timezone
 
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import device_kwargs, load_config
-from busybar.display import OVERLAY_DWELL_SECONDS, overlay_gap_elapsed
+from busybar.display import OVERLAY_DWELL_SECONDS, PRIORITY_OVERLAY, overlay_gap_elapsed
 
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
-    build_ci_payload, build_overlay_payload, compute_alert_fingerprint, evaluate_runs,
-    overlay_frame_sequence, parse_rate_limit, resolve_repo_list, select_running_run,
-    update_snooze,
+    build_overlay_payload, build_overlay_sequence, evaluate_runs,
+    LED_OFF_COLOR, LED_OFF_ELEMENTS, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
+    parse_rate_limit, resolve_ci_led_value, resolve_repo_list, select_running_run,
 )
 
 APP = "ci_status"
@@ -88,8 +88,7 @@ def run_once(client, poller, cfg: dict, now: datetime,
              running_cache: dict[str, list[dict]] | None = None,
              overlay_state: dict | None = None,
              quota_cache: dict | None = None,
-             repo_cache: dict | None = None,
-             snooze_state: dict | None = None) -> str:
+             repo_cache: dict | None = None) -> str:
     """`running_cache`, `overlay_state`, `quota_cache`, and `repo_cache`,
     when passed, are caller-owned dicts this function mutates in place
     (mirroring `state_cache`'s existing pattern) so `main()` can hold one
@@ -113,11 +112,10 @@ def run_once(client, poller, cfg: dict, now: datetime,
     slots forgotten via `forget_repo`) so a stale failure/stuck alert or
     running badge can't linger for a repo that's no longer being watched.
 
-    Overlay rotation: while a run is active (and no failure/stuck alert
-    preempts it), the overlay tier draws one frame per dwell slot, cycling
-    through `overlay_frame_sequence(show_quota)` (the running badge, then
-    -- if `show_quota` -- the GraphQL and REST quota frames). A dwell slot
-    only fires once `overlay_gap_elapsed(last_dwell_end, now) >=
+    Overlay rotation: the overlay tier draws one frame per dwell slot,
+    cycling through `build_overlay_sequence(...)`'s ordered frame list (see
+    the "Failure/stuck/green rotation" paragraph below for what populates
+    it). A dwell slot only fires once `overlay_gap_elapsed(last_dwell_end, now) >=
     OVERLAY_DWELL_SECONDS` (busybar.display's contract: stay silent at
     least one full dwell so the ambient calendar has a real chance to
     reclaim the screen in between -- see busybar/display.py and the spec
@@ -151,13 +149,19 @@ def run_once(client, poller, cfg: dict, now: datetime,
     "no shape on record" and wrongly concluded no clear was needed on the
     next transition.
 
-    Alert snooze (v1.5.2, `snooze_state`): omitting it (the default) skips
-    the snooze subsystem entirely -- every poll behaves exactly as if
-    nothing were ever snoozed. When given, see
-    `ci_status.logic.update_snooze`'s docstring for the full state
-    machine; `client.get_busy()` is polled only while there's something
-    to track (an alert currently showing, or an existing pending/timed
-    snooze), never on a fully idle poll.
+    Failure/stuck/green rotation (v1.6, Request B): the overlay tier's
+    rotation is no longer gated on a run being active -- `build_overlay_sequence`
+    folds in one frame per failing run, one per stuck run, the running CI
+    badge (only while a run is active), each available quota frame, and a
+    single quiet-green frame (only when nothing else is present and
+    `show_green` is on), and the dwell/silence gate above applies uniformly
+    across all of them. This means a failure rotates into view and keeps
+    rotating even with no CI run currently in progress, instead of only
+    showing while `running_cache`/`show_running` happened to have something
+    active. `overlay_state["led_was_on"]` tracks the failure-driven LED
+    across polls (see `resolve_ci_led_value`): it commits to
+    `led_should_be_on` only once a draw actually lands (DRAWN), same DRAWN
+    discipline as `frame_index`/`last_dwell_end`.
     """
     c = cfg["ci_status"]
     timeout_s = int(c["poll_seconds"] * 1.5)
@@ -188,131 +192,96 @@ def run_once(client, poller, cfg: dict, now: datetime,
         if runs is not None:  # None = 304/no-change/error -> keep cached state
             state_cache[repo] = evaluate_runs(repo, runs, now,
                                               c["stale_queued_minutes"])
+
     states = list(state_cache.values())
-    has_alert = any(s.failing or s.stuck for s in states)
 
-    # Alert snooze via the device's native start button (v1.5.2) -- see
-    # ci_status.logic.update_snooze's docstring for the full state
-    # machine. get_busy() is polled only while there's something to
-    # track (an alert showing, or an existing pending/timed snooze),
-    # never on a fully idle poll, to keep idle cycles lean.
-    suppress_alert = False
-    suppress_led = False
-    if snooze_state is not None:
-        snooze_minutes = c.get("snooze_minutes", 0)
-        alert_fingerprint = compute_alert_fingerprint(states)
-        should_poll_busy = not dry_run and snooze_minutes > 0 and (
-            bool(alert_fingerprint) or bool(snooze_state.get("fingerprint")))
-        if should_poll_busy:
-            busy = client.get_busy() or {}
-            busy_active = busy.get("type") not in (None, "NOT_STARTED")
-        else:
-            # None, not False -- "not polled this cycle," distinct from a
-            # confirmed-inactive observation. update_snooze only commits
-            # its session_was_active tracking when given a real bool; see
-            # its docstring for the exact bug a dummy False here caused
-            # (a false-positive auto-snooze for a session that predated
-            # the alert).
-            busy_active = None
-        suppress_alert, suppress_led = update_snooze(
-            alert_fingerprint, busy_active, now, snooze_minutes, snooze_state)
-
-    # While snoozed, ci_status behaves as if nothing is failing/stuck at
-    # all for every OTHER precedence purpose too -- "running/quota
-    # rotation and green behavior unaffected" is the explicit design
-    # intent, not just the alert badge's own rendering (build_ci_payload,
-    # below, gets the same suppress_alert). The overlay rotation's own
-    # "an alert takes precedence" check needs the identical view.
-    effective_has_alert = has_alert and not suppress_alert
-
-    overlay_payload = None
-    frame_index = 0
-    stay_silent = False
-    frame_data_unavailable = False
-
-    # running_cache check first: short-circuits before touching c["show_running"],
-    # so callers/tests using an older, fully-spelled-out cfg dict that predates
-    # this key (and never pass running_cache) don't KeyError.
+    # Running detection (unchanged gating): a live run enables the CI badge and,
+    # with show_quota, the quota frames. Independent of failures, which rotate
+    # regardless of whether anything is running.
+    running_info = None
+    running_present = False
+    quota_by_bucket = None
+    quota_frames: list[str] = []
     if running_cache is not None and c["show_running"]:
         for repo in effective_repos:
             running_runs = poller.fetch_running_runs(repo)
-            if running_runs is not None:  # None = 304/no-change/error -> keep cached
+            if running_runs is not None:
                 running_cache[repo] = running_runs
         selected = select_running_run(running_cache)
-
-        if selected is None or effective_has_alert:
-            # Nothing running, or an alert takes precedence this poll --
-            # reset only the ROTATION bookkeeping, so the next run to start
-            # always begins at the CI badge. Deliberately do NOT touch
-            # last_shape here -- see the docstring above.
-            if overlay_state is not None:
-                overlay_state.pop("frame_index", None)
-                overlay_state.pop("last_dwell_end", None)
-        else:
+        if selected is not None:
             run, repo, other_count = selected
             median = poller.fetch_median_eta(repo, run["workflow_id"])
             running_info = RunningInfo(run=run, repo=repo, other_count=other_count,
                                        median_minutes=median, now=now)
-            quota_by_bucket = _refresh_quota(poller, quota_cache, now) if c["show_quota"] else None
+            running_present = True
+            if c["show_quota"]:
+                quota_by_bucket = _refresh_quota(poller, quota_cache, now)
+                if quota_by_bucket:
+                    if "graphql" in quota_by_bucket:
+                        quota_frames.append(OVERLAY_FRAME_QUOTA_GQL)
+                    if "core" in quota_by_bucket:
+                        quota_frames.append(OVERLAY_FRAME_QUOTA_REST)
 
-            sequence = overlay_frame_sequence(c["show_quota"])
-            frame_index = (overlay_state.get("frame_index", 0) if overlay_state is not None else 0) % len(sequence)
-            last_dwell_end = overlay_state.get("last_dwell_end") if overlay_state is not None else None
+    sequence = build_overlay_sequence(states, running_present=running_present,
+                                      quota_frames=quota_frames, show_green=c["show_green"])
 
-            if overlay_gap_elapsed(last_dwell_end, now) >= OVERLAY_DWELL_SECONDS:
-                frame_name = sequence[frame_index]
-                overlay_payload = build_overlay_payload(
-                    frame_name, OVERLAY_DWELL_SECONDS,
-                    running=running_info, quota_by_bucket=quota_by_bucket,
-                    show_spinner=c.get("running_spinner", False))
-                if overlay_payload is None:
-                    # This frame's data wasn't available this cycle (e.g. a
-                    # quota frame with no fresh rate_limit data). Advance
-                    # past it without consuming a dwell -- nothing was
-                    # shown, so there's no gap to protect -- and skip this
-                    # poll's draw entirely (no draw, no clear): whatever was
-                    # already on screen is still within its own dwell
-                    # timeout and is left exactly as it is.
-                    if overlay_state is not None:
-                        overlay_state["frame_index"] = frame_index + 1
-                    frame_data_unavailable = True
-            else:
-                stay_silent = True
+    # Failure-driven LED (Request B keeps a gentle cue). led_should_be_on is
+    # driven by FAILURES only -- stuck keeps its historical LED-None behavior.
+    led_should_be_on = any(s.failing for s in states)
+    led_was_on = bool(overlay_state.get("led_was_on")) if overlay_state is not None else False
+    led_value = resolve_ci_led_value(led_should_be_on, led_was_on)
 
-    if stay_silent:
-        return "overlay dwell gap; staying silent (letting the ambient app reclaim the screen)"
-    if frame_data_unavailable:
-        return "overlay frame data unavailable this cycle; skipping (no draw, no clear)"
-
-    payload = build_ci_payload(states, c["show_green"], timeout_s, overlay=overlay_payload,
-                               suppress_alert=suppress_alert, suppress_led=suppress_led)
-    if dry_run:
-        return f"DRY-RUN payload: {payload!r}"
-    if payload is None:
+    # Empty sequence -> nothing to show. Honor an explicit LED-off transition
+    # (there is no failure now, so led_value is either LED_OFF_COLOR or None).
+    if not sequence:
+        if overlay_state is not None:
+            overlay_state.pop("frame_index", None)
+            overlay_state.pop("last_dwell_end", None)
+        if dry_run:
+            return "DRY-RUN: nothing to show"
+        if led_value == LED_OFF_COLOR:
+            result = client.draw(APP, LED_OFF_ELEMENTS, priority=PRIORITY_OVERLAY,
+                                 led_notification_color=LED_OFF_COLOR)
+            if result == DrawResult.DRAWN and overlay_state is not None:
+                overlay_state["led_was_on"] = False
+                overlay_state["last_shape"] = frozenset(e["id"] for e in LED_OFF_ELEMENTS)
+            return f"led off; {result.value}"
         client.clear(APP)
         if overlay_state is not None:
-            overlay_state["last_shape"] = None  # device is now genuinely blank
-        return "all green; cleared"
+            overlay_state["last_shape"] = None
+        return "nothing to show; cleared"
 
-    # Unified shape check (see docstring): applies to this draw regardless
-    # of which tier produced it -- alert, quiet-green, or an overlay frame.
+    # Dwell gate: one frame per dwell, then silent one dwell so the ambient
+    # calendar can reclaim the gap. frame_index/last_dwell_end commit only on DRAWN.
+    seq_len = len(sequence)
+    frame_index = (overlay_state.get("frame_index", 0) if overlay_state is not None else 0) % seq_len
+    last_dwell_end = overlay_state.get("last_dwell_end") if overlay_state is not None else None
+    if overlay_gap_elapsed(last_dwell_end, now) < OVERLAY_DWELL_SECONDS:
+        return "overlay dwell gap; staying silent (letting the ambient app reclaim the screen)"
+
+    payload = build_overlay_payload(sequence[frame_index], OVERLAY_DWELL_SECONDS,
+                                    running=running_info, quota_by_bucket=quota_by_bucket,
+                                    show_spinner=c.get("running_spinner", False))
+
+    if dry_run:
+        return f"DRY-RUN payload: {payload!r} led={led_value}"
+
+    # Unified shape-clear gate (see the original docstring): the firmware upserts
+    # by element id within an application_name, so a shape change needs a clear
+    # first. Spans every frame kind that can draw here.
     shape = frozenset(e["id"] for e in payload["elements"])
     if overlay_state is not None:
         last_shape = overlay_state.get("last_shape")
         if last_shape is not None and last_shape != shape:
-            # clear()'s own success/failure is intentionally not checked
-            # here, same reasoning as calendar_countdown's transition-clear:
-            # only draw()'s result below gates the state commit.
             client.clear(APP)
 
     result = client.draw(APP, payload["elements"], priority=payload["priority"],
-                         led_notification_color=payload["led"])
-
+                         led_notification_color=led_value)
     if result == DrawResult.DRAWN and overlay_state is not None:
         overlay_state["last_shape"] = shape
-        if overlay_payload is not None:
-            overlay_state["frame_index"] = frame_index + 1
-            overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
+        overlay_state["led_was_on"] = led_should_be_on
+        overlay_state["frame_index"] = frame_index + 1
+        overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
 
     text = next(e["text"] for e in payload["elements"] if e["type"] == "text")
     return f"{text[:40]!r} -> {result.value}"
@@ -375,13 +344,12 @@ def main() -> int:
     overlay_state: dict = {}
     quota_cache: dict = {}
     repo_cache: dict = {}
-    snooze_state: dict = {}
     backoff = 5
     while True:
         summary = run_once(client, poller, cfg, datetime.now(timezone.utc),
                            state_cache, args.dry_run, running_cache=running_cache,
                            overlay_state=overlay_state, quota_cache=quota_cache,
-                           repo_cache=repo_cache, snooze_state=snooze_state)
+                           repo_cache=repo_cache)
         log.info(summary)
         if args.once:
             return 0
