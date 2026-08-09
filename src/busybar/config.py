@@ -74,9 +74,6 @@ DEFAULTS: dict = {
         "repos_exclude": [],       # silence specific repos without leaving account mode
         "active_within_days": 30,  # only repos pushed within this window are polled
         "repo_refresh_minutes": 60,  # how often the repo list itself is re-enumerated
-        # Alert snooze via the device's native start button (v1.5.2) -- see
-        # ci_status/README.md's "Snoozing alerts" section. 0 disables.
-        "snooze_minutes": 30,
         "running_spinner": True,        # animated 8x8 spinner on the running badge
     },
     "nyan_filler": {
