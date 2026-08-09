@@ -14,6 +14,7 @@ from ci_status.logic import (
     parse_rate_limit, _quota_headroom, _quota_used_width,
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
     compute_alert_fingerprint, update_snooze, RUN_SPINNER_ID,
+    resolve_ci_led_value, CI_LED_COLOR, LED_OFF_COLOR, LED_OFF_ELEMENTS,
 )
 from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
 from calendar_countdown.logic import _text_width_px
@@ -925,3 +926,22 @@ def test_no_spinner_and_full_title_when_off():
     els = p["elements"]
     assert not any(e["id"] == RUN_SPINNER_ID for e in els)
     assert next(e for e in els if e["id"] == "title")["width"] == 68  # unchanged
+
+
+# --- failure-driven LED lifecycle (v1.6, task 3) -----------------------------------
+
+def test_led_value_red_while_failing():
+    assert resolve_ci_led_value(True, False) == CI_LED_COLOR
+    assert resolve_ci_led_value(True, True) == CI_LED_COLOR
+
+def test_led_value_explicit_off_on_transition():
+    assert resolve_ci_led_value(False, True) == LED_OFF_COLOR
+
+def test_led_value_omitted_once_already_off():
+    assert resolve_ci_led_value(False, False) is None
+
+def test_led_off_elements_is_single_expiring_placeholder():
+    assert len(LED_OFF_ELEMENTS) == 1
+    el = LED_OFF_ELEMENTS[0]
+    assert el["type"] == "rectangle" and el["width"] == 1 and el["height"] == 1
+    assert el["fill_colors"] == ["#00000000"] and el["timeout"] == 5

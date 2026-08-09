@@ -618,6 +618,34 @@ OVERLAY_FRAME_FAIL = "fail"
 OVERLAY_FRAME_STUCK = "stuck"
 OVERLAY_FRAME_GREEN = "green"
 
+CI_LED_COLOR = "#FF0000FF"
+LED_OFF_COLOR = "#00000000"
+# ^ Explicit LED-off (zero alpha). Whether omitting led_notification_color
+# turns a lit LED off is not observable through this device's API, so the
+# on->off transition sends this value explicitly -- same hypothesis-agnostic
+# choice calendar_countdown makes (see its resolve_led_value / LED_OFF_COLOR).
+LED_OFF_ELEMENTS = [{
+    "id": "ci_led_off_flush", "type": "rectangle", "x": 0, "y": 0,
+    "width": 1, "height": 1, "fill": "solid", "fill_colors": ["#00000000"],
+    "border_width": 0, "timeout": 5,
+}]
+# ^ Minimal 1x1 transparent self-expiring element -- the draw endpoint requires
+# >=1 element, so a bare led_notification_color with no element is impossible.
+# Used on the "nothing else to draw but the LED must go off" path (main.run_once).
+
+
+def resolve_ci_led_value(led_should_be_on: bool, led_was_on: bool) -> str | None:
+    """The led_notification_color to send THIS poll: CI_LED_COLOR while any
+    failure exists; LED_OFF_COLOR (explicit) on the exact failing->clear poll;
+    None (omit) once already off. main.run_once tracks `led_was_on` in its
+    caller-owned overlay_state, committed only after a confirmed DRAWN send."""
+    if led_should_be_on:
+        return CI_LED_COLOR
+    if led_was_on:
+        return LED_OFF_COLOR
+    return None
+
+
 # Element id sets differ between the CI badge ("eta") and either quota frame
 # ("pct", "reset") -- the draw endpoint upserts by id within an
 # application_name (the same firmware behavior that required the v1.3.1
