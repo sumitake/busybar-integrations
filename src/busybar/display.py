@@ -105,7 +105,9 @@ information may draw here instead of PRIORITY_AMBIENT (v1.5.2). Strictly
 above PRIORITY_OVERLAY (21) -- so a raised-tier ambient draw can no longer
 be silently interrupted by an overlay-tier dwell rotation (e.g. the
 running-CI badge/quota frames) -- and strictly below PRIORITY_ALERT (60)
--- a genuine alert still wins over a merely-approaching event. This tier
+-- were anything to draw at that tier, it would still win over a
+merely-approaching event, though as of v1.7 nothing in this repo does
+(see PRIORITY_ALERT's own docstring). This tier
 exists for the "approach" window: calendar_countdown uses it once an
 event is within `approach_minutes` of starting but still outside its
 `notice_minutes` window (see calendar_countdown.logic.select_priority).
@@ -117,33 +119,47 @@ higher only if it is itself carrying ambient, not overlay, semantics
 """
 
 PRIORITY_ALERT = 60
-"""Urgent, preempting states (e.g. CI failure/stuck badges). Always wins
-over PRIORITY_AMBIENT, PRIORITY_OVERLAY, and PRIORITY_AMBIENT_RAISED by
-virtue of being a strictly higher number (fact 1 above) -- no dwell/
-silence contract; draw immediately and keep redrawing every poll while
-the condition holds.
+"""Urgent, preempting states. Always wins over PRIORITY_AMBIENT,
+PRIORITY_OVERLAY, and PRIORITY_AMBIENT_RAISED by virtue of being a
+strictly higher number (fact 1 above) -- no dwell/silence contract; draw
+immediately and keep redrawing every poll while the condition holds.
+
+No integration in this repo currently draws here -- ci_status originally
+drew its failure/stuck badges at this tier (through v1.6) but moved them
+down to PRIORITY_OVERLAY (21) in v1.7, joining the calendar's calm
+dwell/rotation model instead of unconditionally preempting it. This tier
+remains defined as the ladder's alert slot for reference, and for any
+future integration whose update pattern genuinely warrants an
+unconditional preempt.
 """
 
 PRIORITY_AMBIENT_URGENT = 65
 """An ambient app carrying IMMINENT user-critical information may draw
 here instead of PRIORITY_AMBIENT (v1.5.2) -- strictly above
-PRIORITY_ALERT (60), so it can preempt even a genuine, currently-active
-alert (fact 2 means that alert's elements are evicted, not merely
-occluded-and-later-restored -- see the eviction/409 interplay in the spec
-doc's v1.5.2 section for why this is safe: the alert's own app keeps
-trying to redraw every poll per its no-dwell contract, gets a `409`
-REJECTED response while this tier holds the screen, treats that as
-expected and silent, and re-asserts itself the moment this tier drops
-back down -- no cross-process coordination needed). Strictly below
-PRIORITY_SESSION (90) -- a real BUSY/CUSTOM work session still wins.
+PRIORITY_ALERT (60), so it would preempt even a genuine, currently-active
+draw at that tier were anything drawing there (fact 2 means that draw's
+elements are evicted, not merely occluded-and-later-restored -- see the
+eviction/409 interplay in the spec doc's v1.5.2 section for why this was
+designed to be safe: a no-dwell-contract app at PRIORITY_ALERT keeps
+trying to redraw every poll, gets a `409` REJECTED response while this
+tier holds the screen, treats that as expected and silent, and
+re-asserts itself the moment this tier drops back down -- no
+cross-process coordination needed). Strictly below PRIORITY_SESSION (90)
+-- a real BUSY/CUSTOM work session still wins.
 
-This tier exists specifically to close an operator-reported UX gap: a
-persistent CI failure alert was permanently evicting the calendar,
-hiding imminent events with no way for the calendar to ever reclaim the
-screen (an ambient app has no dwell/silence contract of its own to fall
-back on the way the overlay tier does). calendar_countdown elevates here
-once an event enters its `notice_minutes` window and stays here through
-`warn_minutes`, reverting to PRIORITY_AMBIENT once the event starts (see
+This tier was originally added to close an operator-reported UX gap: at
+the time (v1.5.2), ci_status's persistent CI failure alert -- then drawn
+at PRIORITY_ALERT (60) -- was permanently evicting the calendar, hiding
+imminent events with no way for the calendar to ever reclaim the screen
+(an ambient app has no dwell/silence contract of its own to fall back on
+the way the overlay tier does). As of v1.7, ci_status no longer draws at
+PRIORITY_ALERT at all -- its failure/stuck frames moved down to
+PRIORITY_OVERLAY (21), where they take turns in the same calm dwell/
+rotation as everything else -- so this specific gap no longer arises in
+practice. The tier itself, and calendar_countdown's use of it, are
+unchanged: calendar_countdown elevates here once an event enters its
+`notice_minutes` window and stays here through `warn_minutes`, reverting
+to PRIORITY_AMBIENT once the event starts (see
 calendar_countdown.logic.select_priority) -- deliberately NOT while
 merely in_progress, since once a meeting has started you already know
 about it; the elevation exists to catch your attention BEFORE it starts.

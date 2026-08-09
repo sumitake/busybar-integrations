@@ -30,16 +30,22 @@ from calendar_countdown.logic import (  # noqa: E402
 # RUNNING_BADGE_TIMEOUT_S); now PRIORITY_OVERLAY (and, in main.py,
 # OVERLAY_DWELL_SECONDS) from the shared module so future integrations
 # inherit the same contract instead of re-deriving it.
-from busybar.display import PRIORITY_OVERLAY, PRIORITY_ALERT  # noqa: E402
+from busybar.display import PRIORITY_OVERLAY  # noqa: E402
 
 FAILING = {"failure", "timed_out", "startup_failure"}
+
+
+@dataclass(frozen=True)
+class FailingRun:
+    workflow: str   # r["name"]
+    ref: str        # _pr_or_branch(r): "#42", the branch, or ""
 
 
 @dataclass
 class RepoState:
     repo: str
-    failing: list[str]
-    stuck: list[str]
+    failing: list[FailingRun]
+    stuck: list[FailingRun]
 
 
 @dataclass
@@ -137,12 +143,14 @@ def evaluate_runs(repo: str, runs: list[dict], now: datetime,
     failing, stuck = [], []
     for r in latest.values():
         if r.get("conclusion") in FAILING:
-            failing.append(r["name"])
+            failing.append(FailingRun(r["name"], _pr_or_branch(r)))
         elif r.get("status") == "queued" and stale_queued_minutes > 0:
             age_min = (now - _parse_ts(r["created_at"])).total_seconds() / 60
             if age_min >= stale_queued_minutes:
-                stuck.append(r["name"])
-    return RepoState(repo=repo, failing=sorted(failing), stuck=sorted(stuck))
+                stuck.append(FailingRun(r["name"], _pr_or_branch(r)))
+    key = lambda f: (f.workflow, f.ref)
+    return RepoState(repo=repo, failing=sorted(failing, key=key),
+                     stuck=sorted(stuck, key=key))
 
 
 # --- overlay tier: shared row template (v1.5) -----------------------------------
@@ -606,69 +614,109 @@ def _build_quota_elements(info: QuotaInfo, timeout_s: int) -> list[dict]:
 OVERLAY_FRAME_CI_BADGE = "ci_badge"
 OVERLAY_FRAME_QUOTA_GQL = "quota_gql"
 OVERLAY_FRAME_QUOTA_REST = "quota_rest"
+OVERLAY_FRAME_FAIL = "fail"
+OVERLAY_FRAME_STUCK = "stuck"
+OVERLAY_FRAME_GREEN = "green"
 
-# Element id sets differ between the CI badge ("eta") and either quota frame
-# ("pct", "reset") -- the draw endpoint upserts by id within an
-# application_name (the same firmware behavior that required the v1.3.1
-# calendar transition-clear fix), so switching between these two *shapes*
-# without an explicit clear would leave a stale numeral element from the
-# previous shape rendered alongside the new one. quota_gql and quota_rest
-# share an identical id set, so switching between *those* needs no clear.
-# NOTE: this dict is documentation/reference only -- main.py's actual
-# clear-gate does NOT consult it. It instead compares the *literal*
-# frozenset of element ids on each drawn payload (frozenset(e["id"] for e
-# in payload["elements"])), unified across every tier that can draw to
-# APP (alert, quiet-green, and both overlay frame kinds), not just these
-# two overlay shapes -- see run_once's docstring in ci_status/main.py for
-# why a badge/quota-only mapping here wasn't enough (it missed the
-# alert<->overlay and green<->overlay seams entirely).
-OVERLAY_FRAME_SHAPE = {
-    OVERLAY_FRAME_CI_BADGE: "badge",
-    OVERLAY_FRAME_QUOTA_GQL: "quota",
-    OVERLAY_FRAME_QUOTA_REST: "quota",
-}
+CI_LED_COLOR = "#FF0000FF"
+LED_OFF_COLOR = "#00000000"
+# ^ Explicit LED-off (zero alpha). Whether omitting led_notification_color
+# turns a lit LED off is not observable through this device's API, so the
+# on->off transition sends this value explicitly -- same hypothesis-agnostic
+# choice calendar_countdown makes (see its resolve_led_value / LED_OFF_COLOR).
+LED_OFF_ELEMENTS = [{
+    "id": "ci_led_off_flush", "type": "rectangle", "x": 0, "y": 0,
+    "width": 1, "height": 1, "fill": "solid", "fill_colors": ["#00000000"],
+    "border_width": 0, "timeout": 5,
+}]
+# ^ Minimal 1x1 transparent self-expiring element -- the draw endpoint requires
+# >=1 element, so a bare led_notification_color with no element is impossible.
+# Used on the "nothing else to draw but the LED must go off" path (main.run_once).
 
 
-def overlay_frame_sequence(show_quota: bool) -> list[str]:
-    """The rotation order for the overlay tier's dwell slots. The running
-    badge always leads (and is the only frame at all when show_quota is
-    off), so a run's very first overlay draw is always the CI badge, never
-    a quota frame."""
-    if show_quota:
-        return [OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST]
-    return [OVERLAY_FRAME_CI_BADGE]
+def resolve_ci_led_value(led_should_be_on: bool, led_was_on: bool) -> str | None:
+    """The led_notification_color to send THIS poll: CI_LED_COLOR while any
+    failure exists; LED_OFF_COLOR (explicit) on the exact failing->clear poll;
+    None (omit) once already off. main.run_once tracks `led_was_on` in its
+    caller-owned overlay_state, committed only after a confirmed DRAWN send."""
+    if led_should_be_on:
+        return CI_LED_COLOR
+    if led_was_on:
+        return LED_OFF_COLOR
+    return None
 
 
-def build_overlay_payload(frame_name: str, timeout_s: int, *,
-                         running: RunningInfo | None = None,
-                         quota_by_bucket: dict[str, QuotaInfo] | None = None,
-                         show_spinner: bool = False) -> dict | None:
-    """Build the {"elements", "priority", "led"} payload for one overlay-
-    tier dwell slot, or `None` if this frame's data isn't available this
-    cycle -- the caller must treat `None` as "skip this dwell slot
-    entirely" (no draw, no clear), never substitute stale or placeholder
-    content. This is what lets rate_limit fetch failures silently drop a
-    quota frame from rotation for a cycle instead of crashing or showing
-    minutes-old numbers (see main.py's 5-minute staleness check, which
-    is what actually keeps `quota_by_bucket` fresh enough to trust here).
+def build_overlay_payload(descriptor: dict, timeout_s: int, *,
+                          running: RunningInfo | None = None,
+                          quota_by_bucket: dict[str, QuotaInfo] | None = None,
+                          show_spinner: bool = False) -> dict | None:
+    """Build the {"elements", "priority", "led"} payload for one overlay-tier
+    dwell slot from a frame descriptor ({"kind": ...} plus kind-specific
+    fields). Returns None only if a frame's data isn't available this cycle;
+    build_overlay_sequence never emits a descriptor whose data is missing, so
+    in practice callers get a payload. `led` is always None here -- the
+    failure-driven LED is resolved by the caller (see resolve_ci_led_value).
+
+    A `None` return means "skip this dwell slot entirely" (no draw, no
+    clear), never substitute stale or placeholder content. This is what lets
+    rate_limit fetch failures silently drop a quota frame from rotation for
+    a cycle instead of crashing or showing minutes-old numbers (see main.py's
+    5-minute staleness check, which is what actually keeps `quota_by_bucket`
+    fresh enough to trust here).
 
     `show_spinner` (v1.6) is threaded through ONLY on the CI-badge branch
     -- quota frames never get a spinner, regardless of this flag. Defaults
     to False so existing callers are unaffected.
     """
-    if frame_name == OVERLAY_FRAME_CI_BADGE:
+    kind = descriptor["kind"]
+    if kind == OVERLAY_FRAME_CI_BADGE:
         if running is None:
             return None
         return {"elements": _build_running_elements(running, timeout_s, show_spinner=show_spinner),
                 "priority": PRIORITY_OVERLAY, "led": None}
-    if frame_name in (OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST):
-        bucket_key = "graphql" if frame_name == OVERLAY_FRAME_QUOTA_GQL else "core"
+    if kind in (OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST):
+        bucket_key = "graphql" if kind == OVERLAY_FRAME_QUOTA_GQL else "core"
         info = (quota_by_bucket or {}).get(bucket_key)
         if info is None:
             return None
         return {"elements": _build_quota_elements(info, timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
+    if kind == OVERLAY_FRAME_FAIL:
+        text = "CI FAIL " + _fail_line(descriptor["repo"], descriptor["run"])
+        return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
+                "priority": PRIORITY_OVERLAY, "led": None}
+    if kind == OVERLAY_FRAME_STUCK:
+        text = "CI stuck " + _fail_line(descriptor["repo"], descriptor["run"])
+        return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
+                "priority": PRIORITY_OVERLAY, "led": None}
+    if kind == OVERLAY_FRAME_GREEN:
+        return {"elements": [_text_element("CI ok", "#00FF00FF", timeout_s)],
+                "priority": PRIORITY_OVERLAY, "led": None}
     return None
+
+
+def build_overlay_sequence(states: list[RepoState], *, running_present: bool,
+                           quota_frames: list[str], show_green: bool) -> list[dict]:
+    """The ordered overlay-tier rotation for this poll: one frame per failing
+    run, then one per stuck run, then the running CI badge (if a run is
+    active), then each available quota frame, then a single quiet-green frame
+    ONLY when nothing else is present and show_green is on. Each fail/stuck
+    descriptor carries its repo and FailingRun so the renderer needs no extra
+    lookup."""
+    seq: list[dict] = []
+    for s in states:
+        for fr in s.failing:
+            seq.append({"kind": OVERLAY_FRAME_FAIL, "repo": s.repo, "run": fr})
+    for s in states:
+        for fr in s.stuck:
+            seq.append({"kind": OVERLAY_FRAME_STUCK, "repo": s.repo, "run": fr})
+    if running_present:
+        seq.append({"kind": OVERLAY_FRAME_CI_BADGE})
+    for frame in quota_frames:
+        seq.append({"kind": frame})
+    if not seq and show_green:
+        seq.append({"kind": OVERLAY_FRAME_GREEN})
+    return seq
 
 
 def _text_element(text: str, color: str, timeout_s: int, font: str = "normal") -> dict:
@@ -676,6 +724,12 @@ def _text_element(text: str, color: str, timeout_s: int, font: str = "normal") -
             "x": 0, "y": 4, "width": 72, "color": color,
             "scroll_rate": 2000, "scroll_start_delay": 1000,
             "scroll_repeat_delay": 2000, "timeout": timeout_s}
+
+
+def _fail_line(repo: str, fr: FailingRun) -> str:
+    """"owner/repo #42 · workflow" (the ref is dropped when empty)."""
+    ref = f" {fr.ref}" if fr.ref else ""
+    return f"{repo}{ref} · {fr.workflow}"
 
 
 def _badge_elements(text: str, bg_color: str, text_color: str, timeout_s: int) -> list[dict]:
@@ -687,217 +741,3 @@ def _badge_elements(text: str, bg_color: str, text_color: str, timeout_s: int) -
           "timeout": timeout_s}
     return [bg, _text_element(text, text_color, timeout_s, font="bold")]
 
-
-def build_ci_payload(states: list[RepoState], show_green: bool, timeout_s: int,
-                     overlay: dict | None = None, suppress_alert: bool = False,
-                     suppress_led: bool = False) -> dict | None:
-    """Precedence: failure > stuck > overlay (whichever frame the caller's
-    rotation picked -- the running badge or a quota frame) > quiet green >
-    nothing. Failure and stuck stay at PRIORITY_ALERT (60, unchanged) and
-    are evaluated first specifically so they always win even if an overlay
-    condition is also true in the same poll -- an active alert must never
-    be preempted by "just" a status update. `overlay`, when given, is a
-    fully pre-built payload dict from `build_overlay_payload` (already
-    carrying its own `priority`/`elements`/`led`) so this function's job is
-    purely precedence, not rendering.
-
-    `suppress_alert` (v1.5.2 snooze) skips the failure/stuck branches
-    entirely when true -- the caller (main.run_once, via update_snooze)
-    has decided this exact alert fingerprint is currently snoozed, so
-    precedence falls through to overlay/quiet-green/nothing exactly as if
-    nothing were failing: "running/quota rotation and green behavior
-    unaffected" per the snooze design. `suppress_led` (also v1.5.2) blanks
-    the failure branch's LED specifically, without suppressing the alert
-    draw itself -- used during the snooze-PENDING phase (a BUSY session is
-    active but hasn't ended yet): the alert's own element draw still
-    proceeds as normal (and gets naturally rejected by the session's
-    higher priority, same as always), but the LED -- a separate channel
-    that is NOT gated by the same priority arbitration and would otherwise
-    keep blinking through the session -- is silenced once the operator has
-    visibly acknowledged the alert by starting a session. `suppress_led`
-    has no effect on the stuck branch (its LED is already always `None`).
-    """
-    failures = [(s.repo, name) for s in states for name in s.failing]
-    stuck = [(s.repo, name) for s in states for name in s.stuck]
-    if failures and not suppress_alert:
-        text = "CI FAIL " + " ".join(f"{repo}:{name}" for repo, name in failures)
-        led = None if suppress_led else "#FF0000FF"
-        return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
-                "priority": PRIORITY_ALERT, "led": led}
-    if stuck and not suppress_alert:
-        text = "CI stuck " + " ".join(f"{repo}:{name}" for repo, name in stuck)
-        return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
-                "priority": PRIORITY_ALERT, "led": None}
-    if overlay is not None:
-        return overlay
-    if show_green:
-        return {"elements": [_text_element("CI ok", "#00FF00FF", timeout_s)],
-                "priority": PRIORITY_ALERT, "led": None}
-    return None
-
-
-# --- alert snooze via the device's native start button (v1.5.2) -----------------
-#
-# Raw physical button events aren't API-observable (confirmed: the status
-# WebSocket is screen-only), but the BUSY session it starts is, via
-# client.get_busy(). The snooze rule rides on that: an alert showing at the
-# moment a session starts is treated as "the operator saw it and pressed
-# the button" -- once the session ends, that exact failure/stuck fingerprint
-# is suppressed for `snooze_minutes`. Any change to the fingerprint (a new
-# failure, a different workflow, resolved-then-new) immediately clears the
-# snooze and re-alerts; so does the snooze's own expiry if the same
-# fingerprint is still failing.
-
-def compute_alert_fingerprint(states: list[RepoState]) -> frozenset:
-    """The identity of "what's currently alerting" -- a frozenset of
-    `(repo, workflow, category)` triples, category being "failing" or
-    "stuck" so a repo:workflow pair moving between the two categories
-    counts as a fingerprint change (not silently treated as "the same
-    alert"), matching the snooze rule's "ANY fingerprint change... clear
-    snooze, alert immediately." Empty (falsy) when nothing is failing or
-    stuck.
-    """
-    return (frozenset((s.repo, name, "failing") for s in states for name in s.failing)
-           | frozenset((s.repo, name, "stuck") for s in states for name in s.stuck))
-
-
-def update_snooze(alert_fingerprint: frozenset, busy_active: bool | None, now: datetime,
-                  snooze_minutes: int, snooze_state: dict) -> tuple[bool, bool]:
-    """Advances the snooze state machine by one poll and returns
-    `(suppress_alert, suppress_led)` for THIS poll. `snooze_state` is a
-    caller-owned dict (same pattern as every other cache in this codebase),
-    mutated in place, with up to three keys: `"session_was_active"`
-    (tracked every call, for edge-detecting the inactive->active
-    transition -- see below), `"fingerprint"` (the alert fingerprint a
-    pending-or-active snooze applies to), and `"snooze_until"` (absent
-    while pending -- session still running -- set to a datetime once the
-    session ends and the timed snooze begins).
-
-    State machine:
-    1. **Pending** starts only on a genuine inactive -> active transition
-       (edge, not level -- see below) while an alert is currently showing:
-       records `fingerprint`, no `snooze_until` yet. Returns
-       `(False, True)` -- the alert draw itself still proceeds as normal
-       (and will be naturally rejected by the session's own higher
-       priority, same as always), but its LED is suppressed, since LED is
-       a separate channel not gated by that same priority arbitration and
-       would otherwise keep blinking through the session the operator just
-       acknowledged.
-    2. While still **pending** (fingerprint unchanged, session still
-       active): keeps returning `(False, True)`.
-    3. The session **ends** (busy_active goes false) while still pending,
-       same fingerprint: sets `snooze_until = now + snooze_minutes` and
-       returns `(True, False)` -- the timed snooze begins this exact poll.
-    4. While **timed** and `now < snooze_until`, same fingerprint:
-       `(True, False)` -- alert suppressed entirely (falls through to
-       overlay/quiet-green/nothing in build_ci_payload), no LED question
-       even arises since the alert branch never runs.
-    5. **Expiry** (`now >= snooze_until`): state clears, `(False, False)`
-       -- back to alerting normally if still failing.
-    6. **Any fingerprint change** at any pending/timed point: immediately
-       clears the fingerprint/snooze_until (but not the
-       `session_was_active` tracking -- see below), falling through to
-       step 1's logic fresh for the new fingerprint (or `(False, False)`
-       if nothing is failing/stuck anymore, or if a session isn't already
-       active for a fresh pending to start against).
-    7. `snooze_minutes <= 0` disables the feature outright: any existing
-       fingerprint/snooze_until is cleared and `(False, False)` always.
-
-    **Edge, not level, and why the default matters.** Requirement 1 is a
-    TRANSITION ("busy snapshot transitions from inactive... to active"),
-    not a level condition ("an alert is showing and a session happens to
-    be active") -- otherwise a session that was ALREADY running before an
-    alert appeared (or before a fingerprint changed mid-session) would be
-    wrongly treated as "you just pressed the button for this," silently
-    snoozing something the operator never actually acknowledged. Detecting
-    the edge needs to know what the PREVIOUS poll observed, tracked via
-    `session_was_active` -- but polling is deliberately gated (see
-    main.run_once) to skip `get_busy()` entirely when idle (no alert, no
-    snooze state), which means there can be gaps where `session_was_active`
-    wasn't being updated.
-
-    **Critical correctness point (fixed after an initial version got this
-    wrong -- see the regression tests): `session_was_active` is committed
-    ONLY on a poll where `get_busy()` was ACTUALLY called this cycle**,
-    signaled by `busy_active` being a real `bool` rather than `None`.
-    `main.run_once` passes `None` for `busy_active` whenever polling was
-    gated off (idle: no alert, no existing snooze state). An earlier
-    version unconditionally wrote `busy_active` every call, including a
-    dummy `False` for gated-off polls -- which meant a sequence of idle
-    polls (no alert yet) would stamp `session_was_active = False`
-    regardless of the device's ACTUAL state; if a session then started
-    while STILL idle (unobserved, since nothing was polling), and only
-    THEN did an alert appear (triggering the first real `get_busy()` call,
-    correctly observing `busy_active=True`), the stale `False` from the
-    dummy writes would read as "was NOT active a moment ago, now IS
-    active" -- a spurious transition -- and silently start a pending
-    snooze for a failure the operator never acknowledged. Committing only
-    on an actual poll (leaving `session_was_active` untouched otherwise)
-    closes this: an unobserved period leaves the value at whatever it was
-    (or its default) rather than being corrupted by an unpolled guess.
-
-    On the first EVER poll of a fresh process, or the first poll after any
-    gap where `session_was_active` was never committed, it defaults to
-    `True` -- not `False` -- so an as-yet-unobserved busy session is
-    assumed to possibly PRE-DATE the alert rather than assumed absent:
-    the conservative direction is to require an actually-OBSERVED
-    inactive->active transition before granting pending, at the cost of
-    occasionally missing a legitimate fresh session-start that happens to
-    coincide with polling just resuming (a minor inconvenience -- the
-    operator presses the button again -- versus the alternative of a
-    silent, unintended auto-snooze).
-
-    **Restart safety**: a process restart gets a fresh empty
-    `snooze_state`, so `session_was_active` defaults to `True` on the very
-    first poll regardless of the device's actual state -- the same
-    conservative default above, which also happens to correctly prevent a
-    restart-during-an-already-active-session from being misattributed as
-    a fresh button press. In-memory only; documented as a known limitation
-    (a snooze in effect at restart is lost, same as every other cache in
-    this codebase).
-    """
-    was_active = snooze_state.get("session_was_active", True)
-    if busy_active is not None:
-        snooze_state["session_was_active"] = busy_active
-
-    if snooze_minutes <= 0:
-        snooze_state.pop("fingerprint", None)
-        snooze_state.pop("snooze_until", None)
-        return False, False
-
-    pending_fp = snooze_state.get("fingerprint")
-    snooze_until = snooze_state.get("snooze_until")
-
-    if pending_fp is not None and alert_fingerprint != pending_fp:
-        snooze_state.pop("fingerprint", None)
-        snooze_state.pop("snooze_until", None)
-        pending_fp = None
-        snooze_until = None
-
-    if pending_fp is None:
-        if alert_fingerprint and busy_active and not was_active:
-            snooze_state["fingerprint"] = alert_fingerprint
-            snooze_state.pop("snooze_until", None)
-            return False, True
-        return False, False
-
-    if snooze_until is None:
-        # Defensive: main.run_once's polling gate guarantees busy_active
-        # is a real bool (not None) whenever pending_fp is set (a pending
-        # snooze always keeps polling -- see should_poll_busy), so this
-        # should never actually see None here. If it somehow did anyway,
-        # treat "unknown" the same as "still active" (stay pending rather
-        # than prematurely starting the timed snooze on an unpolled
-        # guess) -- the same conservative direction as everywhere else in
-        # this function.
-        if busy_active is None or busy_active:
-            return False, True
-        snooze_state["snooze_until"] = now + timedelta(minutes=snooze_minutes)
-        return True, False
-
-    if now < snooze_until:
-        return True, False
-
-    snooze_state.pop("fingerprint", None)
-    snooze_state.pop("snooze_until", None)
-    return False, False
