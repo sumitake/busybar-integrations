@@ -35,11 +35,17 @@ from busybar.display import PRIORITY_OVERLAY, PRIORITY_ALERT  # noqa: E402
 FAILING = {"failure", "timed_out", "startup_failure"}
 
 
+@dataclass(frozen=True)
+class FailingRun:
+    workflow: str   # r["name"]
+    ref: str        # _pr_or_branch(r): "#42", the branch, or ""
+
+
 @dataclass
 class RepoState:
     repo: str
-    failing: list[str]
-    stuck: list[str]
+    failing: list[FailingRun]
+    stuck: list[FailingRun]
 
 
 @dataclass
@@ -137,12 +143,14 @@ def evaluate_runs(repo: str, runs: list[dict], now: datetime,
     failing, stuck = [], []
     for r in latest.values():
         if r.get("conclusion") in FAILING:
-            failing.append(r["name"])
+            failing.append(FailingRun(r["name"], _pr_or_branch(r)))
         elif r.get("status") == "queued" and stale_queued_minutes > 0:
             age_min = (now - _parse_ts(r["created_at"])).total_seconds() / 60
             if age_min >= stale_queued_minutes:
-                stuck.append(r["name"])
-    return RepoState(repo=repo, failing=sorted(failing), stuck=sorted(stuck))
+                stuck.append(FailingRun(r["name"], _pr_or_branch(r)))
+    key = lambda f: (f.workflow, f.ref)
+    return RepoState(repo=repo, failing=sorted(failing, key=key),
+                     stuck=sorted(stuck, key=key))
 
 
 # --- overlay tier: shared row template (v1.5) -----------------------------------
@@ -678,6 +686,12 @@ def _text_element(text: str, color: str, timeout_s: int, font: str = "normal") -
             "scroll_repeat_delay": 2000, "timeout": timeout_s}
 
 
+def _fail_line(repo: str, fr: FailingRun) -> str:
+    """"owner/repo #42 · workflow" (the ref is dropped when empty)."""
+    ref = f" {fr.ref}" if fr.ref else ""
+    return f"{repo}{ref} · {fr.workflow}"
+
+
 def _badge_elements(text: str, bg_color: str, text_color: str, timeout_s: int) -> list[dict]:
     """Full-panel rounded-rect background + bold scrolling text over it."""
     # border_width=0: RectangleElement defaults to a 1px white border, which
@@ -717,15 +731,15 @@ def build_ci_payload(states: list[RepoState], show_green: bool, timeout_s: int,
     visibly acknowledged the alert by starting a session. `suppress_led`
     has no effect on the stuck branch (its LED is already always `None`).
     """
-    failures = [(s.repo, name) for s in states for name in s.failing]
-    stuck = [(s.repo, name) for s in states for name in s.stuck]
+    failures = [(s.repo, fr) for s in states for fr in s.failing]
+    stuck = [(s.repo, fr) for s in states for fr in s.stuck]
     if failures and not suppress_alert:
-        text = "CI FAIL " + " ".join(f"{repo}:{name}" for repo, name in failures)
+        text = "CI FAIL " + " ".join(_fail_line(repo, fr) for repo, fr in failures)
         led = None if suppress_led else "#FF0000FF"
         return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
                 "priority": PRIORITY_ALERT, "led": led}
     if stuck and not suppress_alert:
-        text = "CI stuck " + " ".join(f"{repo}:{name}" for repo, name in stuck)
+        text = "CI stuck " + " ".join(_fail_line(repo, fr) for repo, fr in stuck)
         return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
                 "priority": PRIORITY_ALERT, "led": None}
     if overlay is not None:

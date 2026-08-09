@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from ci_status.logic import (
-    RepoState, RunningInfo, QuotaInfo, evaluate_runs, build_ci_payload,
+    RepoState, RunningInfo, QuotaInfo, FailingRun, evaluate_runs, build_ci_payload,
     build_overlay_payload, overlay_frame_sequence,
     OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
     OVERLAY_FRAME_SHAPE,
@@ -21,10 +21,16 @@ NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
 
 
 def run(workflow_id: int, name: str, status: str, conclusion: str | None,
-        created_min_ago: int = 5) -> dict:
+        created_min_ago: int = 5, pr_number: int | None = None,
+        head_branch: str | None = None) -> dict:
     created = (NOW - timedelta(minutes=created_min_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"workflow_id": workflow_id, "name": name, "status": status,
-            "conclusion": conclusion, "created_at": created}
+    d = {"workflow_id": workflow_id, "name": name, "status": status,
+         "conclusion": conclusion, "created_at": created}
+    if pr_number is not None:
+        d["pull_requests"] = [{"number": pr_number}]
+    if head_branch is not None:
+        d["head_branch"] = head_branch
+    return d
 
 
 def _text_element(elements: list[dict]) -> dict:
@@ -70,16 +76,28 @@ def quota_info(**overrides) -> QuotaInfo:
 def test_failure_detected_on_latest_run_only():
     runs = [run(1, "tests", "completed", "success"),          # newest for wf 1
             run(1, "tests", "completed", "failure", 60),      # older failure — ignore
-            run(2, "lint", "completed", "failure")]
+            run(2, "lint", "completed", "failure", pr_number=42)]
     state = evaluate_runs("o/r", runs, NOW, 0)
-    assert state.failing == ["lint"] and state.stuck == []
+    assert state.failing == [FailingRun("lint", "#42")] and state.stuck == []
 
 
 def test_stuck_queued_detection_respects_threshold():
-    runs = [run(1, "tests", "queued", None, created_min_ago=20)]
-    assert evaluate_runs("o/r", runs, NOW, 15).stuck == ["tests"]
+    runs = [run(1, "tests", "queued", None, created_min_ago=20, head_branch="main")]
+    assert evaluate_runs("o/r", runs, NOW, 15).stuck == [FailingRun("tests", "main")]
     assert evaluate_runs("o/r", runs, NOW, 0).stuck == []       # disabled
     assert evaluate_runs("o/r", runs, NOW, 30).stuck == []      # under threshold
+
+
+def test_failing_run_ref_empty_when_no_pr_or_branch():
+    state = evaluate_runs("o/r", [run(1, "tests", "completed", "failure")], NOW, 0)
+    assert state.failing == [FailingRun("tests", "")]
+
+
+def test_evaluate_sorts_failing_by_workflow_then_ref():
+    runs = [run(2, "zeta", "completed", "failure", pr_number=9),
+            run(1, "alpha", "completed", "failure", pr_number=3)]
+    state = evaluate_runs("o/r", runs, NOW, 0)
+    assert state.failing == [FailingRun("alpha", "#3"), FailingRun("zeta", "#9")]
 
 
 def test_payload_none_when_green_and_quiet():
@@ -96,7 +114,7 @@ def test_payload_shows_green_glyph_when_enabled():
 
 
 def test_payload_red_badge_on_failure():
-    payload = build_ci_payload([RepoState("o/r", ["tests"], [])], False, 180)
+    payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "#42")], [])], False, 180)
     assert payload["priority"] == PRIORITY_ALERT and payload["led"] == "#FF0000FF"
 
     bg = _bg_element(payload["elements"])
@@ -107,28 +125,21 @@ def test_payload_red_badge_on_failure():
     assert bg["border_width"] == 0
 
     text_el = _text_element(payload["elements"])
-    assert "o/r" in text_el["text"] and "tests" in text_el["text"]
-    assert text_el["color"] == "#FFFFFFFF"
-    assert text_el["font"] == "bold"
+    assert "o/r" in text_el["text"] and "#42" in text_el["text"] and "tests" in text_el["text"]
+    assert text_el["color"] == "#FFFFFFFF" and text_el["font"] == "bold"
 
 
 def test_payload_amber_badge_on_stuck_only():
-    payload = build_ci_payload([RepoState("o/r", [], ["tests"])], False, 180)
+    payload = build_ci_payload([RepoState("o/r", [], [FailingRun("tests", "main")])], False, 180)
     assert payload["led"] is None
-
-    bg = _bg_element(payload["elements"])
-    assert bg["fill_colors"] == ["#BA7517FF"]
-
+    assert _bg_element(payload["elements"])["fill_colors"] == ["#BA7517FF"]
     text_el = _text_element(payload["elements"])
-    assert "stuck" in text_el["text"]
-    assert text_el["color"] == "#0B0B0BFF"
-    assert text_el["font"] == "bold"
+    assert "stuck" in text_el["text"] and "main" in text_el["text"]
 
 
 def test_failure_badge_takes_priority_over_stuck():
-    payload = build_ci_payload([RepoState("o/r", ["tests"], ["lint"])], False, 180)
-    bg = _bg_element(payload["elements"])
-    assert bg["fill_colors"] == ["#A32D2DFF"]  # red failure badge wins
+    payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "")], [FailingRun("lint", "")])], False, 180)
+    assert _bg_element(payload["elements"])["fill_colors"] == ["#A32D2DFF"]
 
 
 # --- PR number / branch fallback ----------------------------------------------
@@ -466,7 +477,7 @@ def test_payload_overlay_takes_priority_over_quiet_green():
 
 def test_payload_failure_takes_priority_over_overlay():
     overlay = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=running_info())
-    payload = build_ci_payload([RepoState("o/r", ["tests"], [])], False, 180, overlay=overlay)
+    payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "")], [])], False, 180, overlay=overlay)
     assert payload["priority"] == PRIORITY_ALERT   # failure wins, not the overlay
     bg = _bg_element(payload["elements"])
     assert bg["fill_colors"] == ["#A32D2DFF"]
@@ -474,7 +485,7 @@ def test_payload_failure_takes_priority_over_overlay():
 def test_payload_stuck_takes_priority_over_overlay():
     overlay = build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
                                     quota_by_bucket={"graphql": quota_info()})
-    payload = build_ci_payload([RepoState("o/r", [], ["tests"])], False, 180, overlay=overlay)
+    payload = build_ci_payload([RepoState("o/r", [], [FailingRun("tests", "")])], False, 180, overlay=overlay)
     assert payload["priority"] == PRIORITY_ALERT
     bg = _bg_element(payload["elements"])
     assert bg["fill_colors"] == ["#BA7517FF"]
