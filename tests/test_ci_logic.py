@@ -629,19 +629,31 @@ def test_compute_alert_fingerprint_empty_when_all_green():
     assert compute_alert_fingerprint([RepoState("o/r", [], [])]) == frozenset()
 
 def test_compute_alert_fingerprint_covers_failing_and_stuck():
-    states = [RepoState("o/r", ["tests"], ["lint"])]
+    states = [RepoState("o/r", [FailingRun("tests", "#42")], [FailingRun("lint", "main")])]
     fp = compute_alert_fingerprint(states)
     assert fp == frozenset({("o/r", "tests", "failing"), ("o/r", "lint", "stuck")})
 
 def test_compute_alert_fingerprint_category_change_is_a_different_fingerprint():
-    failing_fp = compute_alert_fingerprint([RepoState("o/r", ["tests"], [])])
-    stuck_fp = compute_alert_fingerprint([RepoState("o/r", [], ["tests"])])
+    failing_fp = compute_alert_fingerprint([RepoState("o/r", [FailingRun("tests", "#42")], [])])
+    stuck_fp = compute_alert_fingerprint([RepoState("o/r", [], [FailingRun("tests", "#42")])])
     assert failing_fp != stuck_fp
 
 def test_compute_alert_fingerprint_multi_repo():
-    states = [RepoState("o/a", ["tests"], []), RepoState("o/b", ["build"], [])]
+    states = [RepoState("o/a", [FailingRun("tests", "#42")], []),
+              RepoState("o/b", [FailingRun("build", "main")], [])]
     fp = compute_alert_fingerprint(states)
     assert fp == frozenset({("o/a", "tests", "failing"), ("o/b", "build", "failing")})
+
+def test_compute_alert_fingerprint_ignores_ref_flicker():
+    # GitHub's REST API can leave pull_requests empty for a poll or two
+    # before it populates -- _pr_or_branch flips from "" to "#42" across
+    # that window for the SAME ongoing failure. The fingerprint must be
+    # ref-invariant (workflow-name-only) so this flicker doesn't look like
+    # a new alert to update_snooze and spuriously clear an active/pending
+    # snooze or re-fire the LED.
+    no_ref_fp = compute_alert_fingerprint([RepoState("o/r", [FailingRun("tests", "")], [])])
+    with_ref_fp = compute_alert_fingerprint([RepoState("o/r", [FailingRun("tests", "#42")], [])])
+    assert no_ref_fp == with_ref_fp == frozenset({("o/r", "tests", "failing")})
 
 
 # --- update_snooze: the full state machine ---------------------------------------

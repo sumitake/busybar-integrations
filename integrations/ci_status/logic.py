@@ -771,8 +771,8 @@ def compute_alert_fingerprint(states: list[RepoState]) -> frozenset:
     snooze, alert immediately." Empty (falsy) when nothing is failing or
     stuck.
     """
-    return (frozenset((s.repo, name, "failing") for s in states for name in s.failing)
-           | frozenset((s.repo, name, "stuck") for s in states for name in s.stuck))
+    return (frozenset((s.repo, fr.workflow, "failing") for s in states for fr in s.failing)
+           | frozenset((s.repo, fr.workflow, "stuck") for s in states for fr in s.stuck))
 
 
 def update_snooze(alert_fingerprint: frozenset, busy_active: bool | None, now: datetime,
