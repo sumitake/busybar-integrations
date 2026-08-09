@@ -51,19 +51,17 @@ The display is a shared 72×16 canvas. Each integration publishes text, shapes, 
 | Priority | Tier | Occupied by |
 |---|---|---|
 | 20 | `PRIORITY_AMBIENT` | `calendar_countdown`'s baseline countdown (normal and in-progress) |
-| 21 | `PRIORITY_OVERLAY` | `ci_status`'s short-dwell running badge and GitHub GraphQL/REST quota gauges |
+| 21 | `PRIORITY_OVERLAY` | `ci_status`'s rotation — running badge, GitHub GraphQL/REST quota gauges, and failure/stuck/quiet-green frames |
 | 25 | `PRIORITY_AMBIENT_RAISED` | `calendar_countdown` inside `approach_minutes`, outside `notice_minutes` — no longer interruptible by the overlay tier |
-| 60 | `PRIORITY_ALERT` | `ci_status`'s failure/stuck-queue alert badges |
-| 65 | `PRIORITY_AMBIENT_URGENT` | `calendar_countdown` inside `notice_minutes`/`warn_minutes` — outranks even a live alert |
+| 60 | `PRIORITY_ALERT` | Reserved/unused — no in-repo integration currently draws here |
+| 65 | `PRIORITY_AMBIENT_URGENT` | `calendar_countdown` inside `notice_minutes`/`warn_minutes` |
 | 90 | `PRIORITY_SESSION` | An authenticated BUSY/CUSTOM work session on the device — outranks everything else |
 
 Two firmware facts shape all of the above: equal priority from a different `application_name` is **rejected** (`409`), not a hand-off — only a strictly higher number preempts; and a preempted app's elements are **evicted, not restored** — the lower-priority app only reclaims the screen via its own next scheduled redraw, never automatically. Each element carries an optional `timeout`; if its source doesn't refresh within that window, the element self-clears rather than sticking on screen indefinitely.
 
 **Overlay dwell/rotation.** `ci_status`'s overlay-tier frames (running badge, then the GraphQL and REST quota gauges) each draw for one `OVERLAY_DWELL_SECONDS` (10s) dwell slot, then stay silent for at least one more dwell period before redrawing — giving `calendar_countdown`'s own ambient-tier redraws (also tuned to a 10s cadence) a real chance to land in the resulting gap. Because eviction is one-way, the two integrations trade the panel back and forth rather than alternating cleanly; see each integration's README for the measured recovery rates.
 
-**Escalation beats alerts.** As an upcoming calendar event gets closer, `calendar_countdown` climbs from `PRIORITY_AMBIENT` (20) through `PRIORITY_AMBIENT_RAISED` (25, inside `approach_minutes`) to `PRIORITY_AMBIENT_URGENT` (65, inside `notice_minutes`/`warn_minutes`) — strictly above `ci_status`'s own `PRIORITY_ALERT` (60), so a persistent CI failure can no longer permanently bury an imminent event. `ci_status` needs no special handling for this: its alert draw gets a `409` while the calendar holds the higher tier, treats that as an expected rejection, and reappears on its own next poll once the calendar drops back to baseline.
-
-**Snooze by acknowledgment.** `ci_status` alerts can be snoozed entirely through the device's native **start** button — no separate UI or config edit. Starting a BUSY/CUSTOM session while an alert is showing, then ending it, snoozes that exact failure/stuck fingerprint for `snooze_minutes`; any change to the fingerprint (a new failure, or the original resolving and a new one appearing) re-alerts immediately, even mid-snooze.
+**Escalation beats alerts.** `ci_status` no longer draws at `PRIORITY_ALERT`; failure and stuck-queue frames now rotate at `PRIORITY_OVERLAY` (21) alongside the running badge and quota gauges, under the calendar's ambient tiers. As an upcoming calendar event gets closer, `calendar_countdown` climbs from `PRIORITY_AMBIENT` (20) through `PRIORITY_AMBIENT_RAISED` (25, inside `approach_minutes`) to `PRIORITY_AMBIENT_URGENT` (65, inside `notice_minutes`/`warn_minutes`), which already sits strictly above the overlay tier — so an imminent event naturally outranks a CI failure, and the failure frame alternates with the calendar's own redraws rather than camping the panel.
 
 The `application_name` field tags each draw's source, letting the display track ownership and multi-instance behavior.
 
@@ -160,4 +158,4 @@ token, with these results:
 | Integration | Description |
 |---|---|
 | [`calendar_countdown`](integrations/calendar_countdown/) | Live countdown to your next macOS Calendar event. Four-stage escalation as an event approaches — `approach_minutes` (30m default), `notice_minutes` (15m, amber), `warn_minutes` (5m, red), and a final-minute LED blink — plus one audio chirp precisely at event start. The countdown itself turns teal while the event is in progress. Optional `auto_busy` starts a BUSY session automatically for the event's duration. |
-| [`ci_status`](integrations/ci_status/) | GitHub Actions status via the REST API with ETag caching (near-zero steady-state quota cost). Red alert badges on failure, amber on stale-queued runs, either snoozable via the device's native start button. While a run is active, an overlay-tier rotation shows a running badge (ETA plus a "remain"/"left" label) alongside GitHub GraphQL/REST quota gauges. Optional account-wide watching auto-discovers and monitors every repo you own, not just an explicit list. |
+| [`ci_status`](integrations/ci_status/) | GitHub Actions status via the REST API with ETag caching (near-zero steady-state quota cost). Failure and stuck-queue frames rotate calmly at the overlay tier — `CI FAIL owner/repo #42 · workflow` (PR number, or branch when there's no PR) — with a gentle red LED while a workflow is failing. While a run is active, the same rotation adds a running badge (ETA plus a "remain"/"left" label) alongside GitHub GraphQL/REST quota gauges. Optional account-wide watching auto-discovers and monitors every repo you own, not just an explicit list. |

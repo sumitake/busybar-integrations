@@ -2,9 +2,9 @@
 
 ## What It Does
 
-This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. When workflows fail, the device shows a full-panel red badge (rounded background + bold white text) listing the affected `repo:workflow` pairs. When queued runs become stale (stuck due to offline runners or capacity), the device shows a full-panel amber badge with black text instead. Long lists scroll. The integration displays at the **alert** tier (`busybar.display.PRIORITY_ALERT`, priority 60), but an active BUSY session (priority 90) will override the display to show a blinking red status LED instead.
+This integration monitors GitHub Actions workflows across your repositories and displays CI status on the busybar device. **Failure/stuck frames (v1.7):** when a workflow fails or a queued run goes stale (stuck due to offline runners or capacity), the device doesn't take over the panel — instead, a full-panel badge for it joins the same calm **overlay-tier** rotation described below: a red badge (rounded background + bold white text) reading `CI FAIL owner/repo #42 · workflow` for a failure, or an amber badge with black text reading `CI stuck owner/repo #42 · workflow` for a stale-queued run (the `#42` is the PR number, falling back to the branch name when a run has no PR, and dropped entirely when neither is available). One frame per failing/stuck run, alternating with the calendar, the running badge, and the quota frames — not a priority-60 takeover. A gentle red LED stays lit while a workflow is failing (stuck-only states don't light it), and turns off on the poll where the last failure clears.
 
-**While a run is actively in progress** (and nothing is failing or stuck), the device shows a rotating set of **overlay-tier** frames instead: a cyan/blue "running" badge (repo, PR number or branch, and workflow name across the top; an ETA countdown below; a thin progress line tracking elapsed time against the workflow's typical duration), followed by two GitHub API quota frames (`show_quota`) if enabled. These three frames share one dwell/gap rotation with the ambient-tier `calendar_countdown` integration — see "Display Priority Tiers" below for the shared framework this is built on, and "Overlay Rotation: Running Badge + Quota Frames" for content, config, and the measured alternation rhythm.
+**While a run is actively in progress** (and nothing is failing or stuck), the device shows a rotating set of **overlay-tier** frames instead: a cyan/blue "running" badge (repo, PR number or branch, and workflow name across the top; an ETA countdown below; a thin progress line tracking elapsed time against the workflow's typical duration), followed by two GitHub API quota frames (`show_quota`) if enabled. All of these frames share one dwell/gap rotation with the ambient-tier `calendar_countdown` integration — see "Display Priority Tiers" below for the shared framework this is built on, and "Overlay Rotation: Failure, Stuck, Running Badge, and Quota Frames" for content, config, and the measured alternation rhythm.
 
 ## Requirements
 
@@ -88,37 +88,24 @@ Once the foreground test completes, your `config.toml` is in place and GitHub au
 | `repos_exclude` | array of strings | `[]` | Repos to never watch, regardless of mode — silences a specific repo without leaving account mode (or, less commonly, without editing `repos`). Applied last, unconditionally; a no-op when empty. |
 | `active_within_days` | integer | 30 | In account mode, only auto-discovered repos pushed within this many days are watched (caps request volume on large accounts). Repos in `repos` are never subject to this filter. |
 | `repo_refresh_minutes` | integer | 60 | How often the account's repo list is re-enumerated. A newly created (or newly pushed-to, if previously outside the active window) repo is picked up within this interval, not instantly. |
-| `snooze_minutes` | integer | 30 | v1.5.2: how long an alert stays snoozed after you start-then-end a BUSY session on the device while it's showing. `0` disables the feature. See "Snoozing alerts" below. |
 
 ## Account-wide watching
 
 By default this integration watches exactly the repos listed in `repos`. Setting `watch_account_repos = true` switches to a broader mode: the watch list becomes every repo you own (`GET /user/repos?affiliation=owner`, so this does **not** pick up repos you merely have collaborator/org-member access to, only ones under your own account) that's been pushed to within `active_within_days` days, **union** `repos` (always included, never filtered by recency), **minus** `repos_exclude`. New repos are picked up automatically — no config edit needed — within `repo_refresh_minutes` of their creation or of a first push that puts them back inside the active window.
 
-**Private repos are included, and that's intentional.** Discovery has no way to filter private vs. public — it watches everything you own that's active. This is fine for this integration's threat model: both the resulting config state (the discovered list itself, cached in memory) and the physical display are local to your own device and your own account's token. But the practical consequence is real: **a private repo's name can render on the physical display** (in the running badge's title, or in a failure/stuck alert's `repo:workflow` text) exactly like a public one would. If the device sits somewhere visible to people who shouldn't know a private repo exists, either keep `watch_account_repos` off and list repos explicitly, or add sensitive ones to `repos_exclude`.
+**Private repos are included, and that's intentional.** Discovery has no way to filter private vs. public — it watches everything you own that's active. This is fine for this integration's threat model: both the resulting config state (the discovered list itself, cached in memory) and the physical display are local to your own device and your own account's token. But the practical consequence is real: **a private repo's name can render on the physical display** (in the running badge's title, or in a failure/stuck frame's `repo #PR · workflow` text) exactly like a public one would. If the device sits somewhere visible to people who shouldn't know a private repo exists, either keep `watch_account_repos` off and list repos explicitly, or add sensitive ones to `repos_exclude`.
 
 **Quota math.** With N repos in the effective watch list, each poll cycle costs N REST requests to `.../actions/runs` (steady-state, these return `304` and cost nothing against your quota — see "Design: REST-only, Quota-Efficient" above) at `poll_seconds` cadence (default every 120s, so N requests every 2 minutes = up to `N * 30` requests/hour, all free in the steady state), plus N more to the running-runs endpoint whenever `show_running` is on, at `running_poll_seconds` cadence while any run is active. Account-wide discovery itself adds one more request per `repo_refresh_minutes` (default hourly = 1 request/hour, also ETag-cached on its first page — see `RestPoller.fetch_account_repos`'s docstring). None of this touches your real GitHub REST quota unless workflow state is actually changing, since 304s are free; the practical cap that matters is request *volume* (GitHub does rate-limit request rate, not just quota), which is why `active_within_days` exists — it keeps N bounded to your actually-active repos instead of every repo you've ever created.
 
 **Caveat: `active_within_days` filters on `pushed_at`, a repo-level field — it has no idea about *schedule*-triggered workflow runs.** A repo whose CI only ever runs on a cron schedule (no pushes) will fall out of the active window and stop being watched even while its scheduled runs keep firing, because nothing about a scheduled run touches `pushed_at`. If you rely on schedule-triggered CI on a repo that doesn't otherwise see regular pushes, add it to `repos` explicitly (explicit repos are never subject to the active-window filter) rather than relying on account-wide discovery to keep watching it.
 
-## Snoozing alerts
-
-**From the button's perspective:** you're looking at a persistent CI failure or stuck-queue alert on the device, and you already know about it — you don't want to keep seeing it right now. Press the device's native **start** button (the same one that begins a BUSY/CUSTOM session), then press it again to end the session whenever you're ready. Once that session ends, this exact failure stays off the panel for `snooze_minutes` (default 30) — no config edit, no separate acknowledgement step, just the button you were already going to press anyway.
-
-**Why a session, not a dedicated gesture.** Raw physical button presses aren't observable through the device's API at all (confirmed: the status WebSocket only reports what's currently on screen, not button events) — but the BUSY/CUSTOM session the button starts *is*, via `client.get_busy()`. The snooze rule rides on that signal rather than needing a new one: an alert showing at the moment a session starts is treated as "you saw it and pressed the button." While the session runs, the alert is naturally hidden anyway (`PRIORITY_SESSION`, 90, outranks the alert's 60) — the snooze rule's actual work happens once the session *ends*.
-
-**What exactly gets remembered.** The snooze is scoped to the precise set of currently-failing/stuck `repo:workflow` pairs (their "fingerprint"), not "alerts in general." If anything about that set changes while snoozed — a new repo starts failing, a different workflow in the same repo fails, or the original failure resolves and a new one appears — the snooze is dropped immediately and the (new) alert shows right away, even mid-snooze. The snooze also only ever suppresses the alert badge itself: the running-CI badge/quota overlay and the quiet-green "CI ok" text (if enabled) behave exactly as if nothing were snoozed at all.
-
-**During the session itself** (before you've ended it), the alert's own LED — which normally blinks even through a BUSY session, since LED is a separate channel from the panel's own priority arbitration — is suppressed too, the moment the session starts. You pressed the button; the LED doesn't need to keep insisting.
-
-**Restart edge case.** This state is in-memory only, like every other cache in this codebase — a process restart loses any pending or active snooze. A restart that happens to land while a session is *already* active is deliberately treated conservatively: rather than risk assuming a session that predates this process's own observation was "a button press for the alert," a fresh process requires an actually-observed inactive → active transition before it will start a new pending snooze. Practically: if you restart the integration mid-session, you may need to end and (if still needed) re-acknowledge via a fresh session press.
-
 ## Display Priority Tiers
 
-This integration's alert badges (failure/stuck) and its overlay-tier
-frames (running badge, quota frames) both draw through the shared
-priority ladder in `src/busybar/display.py`, along with two firmware
-facts (measured, not assumed — see the design spec's "Display tier
-framework" section for the probe that found them):
+This integration's failure/stuck/quiet-green frames and its running-badge
+and quota frames all draw through the same shared overlay tier in
+`src/busybar/display.py`, along with two firmware facts (measured, not
+assumed — see the design spec's "Display tier framework" section for the
+probe that found them):
 
 - **Equal priority from a different `application_name` is rejected
   outright**, not treated as a hand-off, contrary to what the device's own
@@ -132,29 +119,59 @@ framework" section for the probe that found them):
   that dark gap — see `calendar_countdown`'s README ("Display Priority
   Tiers") for the tuning history and measured recovery rates.
 
-The alert tier (`PRIORITY_ALERT`, 60) sits above the overlay tier and
-preempts it unconditionally — a failure or stuck-queue badge always wins
-over the running badge or a quota frame, per the precedence in
-`build_ci_payload` (failure > stuck > overlay > quiet green > nothing).
+**v1.7: no more alert-tier preemption.** A failure or stuck-queue run no longer
+draws at a separate, higher `PRIORITY_ALERT` (60) tier and no longer
+unconditionally wins the panel — that tier and its `build_ci_payload`
+failure > stuck > overlay > quiet green > nothing precedence chain are
+gone. Instead, one frame per failing run, then one per stuck run, is
+prepended to the same ordered overlay sequence as the running badge and
+quota frames (see `build_overlay_sequence` in `logic.py`), and the whole
+sequence shares the overlay tier's usual dwell/silence rotation with
+`calendar_countdown`. A CI failure therefore behaves like any other
+overlay-tier frame: it takes its turn in the rotation rather than camping
+the panel, and `calendar_countdown`'s escalation into
+`PRIORITY_AMBIENT_RAISED` (25) or `PRIORITY_AMBIENT_URGENT` (65) already
+sits strictly above it, so an approaching or imminent event naturally
+outranks a CI failure with no special-case handling on this integration's
+side. See `calendar_countdown`'s README for the full eviction interplay
+and the priority table.
 
-**v1.5.2: the alert tier is no longer the ceiling.** `calendar_countdown`
-can elevate to `PRIORITY_AMBIENT_URGENT` (65, above `PRIORITY_ALERT`) when
-one of its own events is imminent (see its README's "Escalation ladder")
-— closing an operator-reported gap where a persistent CI failure alert
-permanently buried an imminent calendar event with no way for the
-calendar to ever reclaim the screen. When that happens, this integration's
-own alert draw gets a `409` (`DrawResult.REJECTED`) exactly like it always
-has against the overlay tier's own dwell gaps — `run_once` treats that as
-expected and silent (no state committed, no crash), and the alert
-reappears on its own next poll once the calendar drops back down. See
-`calendar_countdown`'s README for the full eviction/409 interplay and the
-priority table.
+## Overlay Rotation: Failure, Stuck, Running Badge, and Quota Frames
 
-## Overlay Rotation: Running Badge + Quota Frames
+The device rotates through the overlay-tier frames in play this cycle, one
+per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating: one frame
+per currently-failing run, then one per currently-stuck run, then the
+running badge (if a run is `in_progress`), then each available quota
+frame, then — only when nothing else is present and `show_green` is
+on — a single quiet "CI ok" frame. See the design spec
+(`docs/superpowers/specs/2026-08-06-animation-accents-design.md`) for the
+running spinner implementation details.
 
-While any configured repo has an `in_progress` run (and nothing is failing
-or stuck), the device rotates through up to three overlay-tier frames, one
-per dwell slot (`OVERLAY_DWELL_SECONDS`, 10s), before repeating. See the design spec (`docs/superpowers/specs/2026-08-06-animation-accents-design.md`) for the running spinner implementation details.
+### Failure and Stuck Frames (v1.7)
+
+A failing run draws a full-panel red badge (rounded background + bold
+white text) reading `CI FAIL owner/repo #42 · workflow`; a stale-queued
+run draws the same layout in amber with black text, reading `CI stuck
+owner/repo #42 · workflow`. `#42` is the run's PR number where one
+exists, the branch name when it doesn't (push/fork-triggered runs), or
+dropped entirely (along with its leading space) when neither is
+available. Long text scrolls, same as the running badge. Each failing or
+stuck run gets its own frame in the rotation — with several failures or
+stuck runs across repos, expect several red/amber frames in a row before
+the rotation reaches the running badge or quota frames.
+
+A gentle red LED (`led_notification_color`) stays lit for the whole poll
+cycle while any run is failing — it is **not** tied to whether a
+failure/stuck frame happens to be the one currently on screen, and it is
+**not** raised by a stuck-only state (no failures, only stale-queued
+runs). The LED turns off explicitly on the exact poll where the last
+failure clears, then stops being sent once already off.
+
+### Running Badge and Quota Frames
+
+While any configured repo has an `in_progress` run, the running badge and
+(if enabled) two quota frames join the rotation after the failure/stuck
+frames, if any:
 
 1. **Running badge** (always first, always present when `show_running` is
    on): `REPO #PR WORKFLOW` (or `REPO branch-name WORKFLOW` for

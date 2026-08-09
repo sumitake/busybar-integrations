@@ -38,9 +38,11 @@ auto_busy = false
 
 # v1.5.2 escalation ladder -- as an upcoming event gets closer, the calendar
 # climbs busybar/display.py's shared priority ladder so it can no longer be
-# silently buried, first by the overlay-tier CI badge/quota rotation, then
-# by a persistent CI failure/stuck alert. See calendar_countdown/README.md's
-# "Escalation ladder" section before tuning. ASSUMED ORDERING (logged as a
+# silently buried by ci_status's overlay-tier rotation (running badge, quota
+# frames, and -- as of v1.7 -- CI failure/stuck frames too, since those now
+# share the same PRIORITY_OVERLAY tier instead of a separate alert tier).
+# See calendar_countdown/README.md's "Escalation ladder" section before
+# tuning. ASSUMED ORDERING (logged as a
 # one-time startup warning if violated -- see check_threshold_ordering):
 # approach_minutes > notice_minutes > warn_minutes >= imminent_minutes.
 approach_minutes = 30        # inside this (outside notice_minutes): priority rises above the
@@ -70,13 +72,6 @@ watch_account_repos = false
 # repos_exclude = ["your-user/archived-experiment"]  # silence specific repos without leaving account mode
 active_within_days = 30      # only repos pushed within this window are polled
 repo_refresh_minutes = 60    # how often the repo list itself is re-enumerated (new repos picked up within this interval)
-
-# Alert snooze via the device's native start button (v1.5.2). Starting a
-# BUSY session on the device while a CI alert is showing snoozes that exact
-# failure/stuck fingerprint for snooze_minutes once the session ends -- any
-# change (new failure, different workflow, resolved-then-new) re-alerts
-# immediately. See ci_status/README.md's "Snoozing alerts" section.
-snooze_minutes = 30          # 0 disables the feature
 
 [nyan_filler]
 enabled = true                # set false to disable the animation without uninstalling the agent
