@@ -614,6 +614,9 @@ def _build_quota_elements(info: QuotaInfo, timeout_s: int) -> list[dict]:
 OVERLAY_FRAME_CI_BADGE = "ci_badge"
 OVERLAY_FRAME_QUOTA_GQL = "quota_gql"
 OVERLAY_FRAME_QUOTA_REST = "quota_rest"
+OVERLAY_FRAME_FAIL = "fail"
+OVERLAY_FRAME_STUCK = "stuck"
+OVERLAY_FRAME_GREEN = "green"
 
 # Element id sets differ between the CI badge ("eta") and either quota frame
 # ("pct", "reset") -- the draw endpoint upserts by id within an
@@ -647,36 +650,77 @@ def overlay_frame_sequence(show_quota: bool) -> list[str]:
     return [OVERLAY_FRAME_CI_BADGE]
 
 
-def build_overlay_payload(frame_name: str, timeout_s: int, *,
-                         running: RunningInfo | None = None,
-                         quota_by_bucket: dict[str, QuotaInfo] | None = None,
-                         show_spinner: bool = False) -> dict | None:
-    """Build the {"elements", "priority", "led"} payload for one overlay-
-    tier dwell slot, or `None` if this frame's data isn't available this
-    cycle -- the caller must treat `None` as "skip this dwell slot
-    entirely" (no draw, no clear), never substitute stale or placeholder
-    content. This is what lets rate_limit fetch failures silently drop a
-    quota frame from rotation for a cycle instead of crashing or showing
-    minutes-old numbers (see main.py's 5-minute staleness check, which
-    is what actually keeps `quota_by_bucket` fresh enough to trust here).
+def build_overlay_payload(descriptor: dict, timeout_s: int, *,
+                          running: RunningInfo | None = None,
+                          quota_by_bucket: dict[str, QuotaInfo] | None = None,
+                          show_spinner: bool = False) -> dict | None:
+    """Build the {"elements", "priority", "led"} payload for one overlay-tier
+    dwell slot from a frame descriptor ({"kind": ...} plus kind-specific
+    fields). Returns None only if a frame's data isn't available this cycle;
+    build_overlay_sequence never emits a descriptor whose data is missing, so
+    in practice callers get a payload. `led` is always None here -- the
+    failure-driven LED is resolved by the caller (see resolve_ci_led_value).
+
+    A `None` return means "skip this dwell slot entirely" (no draw, no
+    clear), never substitute stale or placeholder content. This is what lets
+    rate_limit fetch failures silently drop a quota frame from rotation for
+    a cycle instead of crashing or showing minutes-old numbers (see main.py's
+    5-minute staleness check, which is what actually keeps `quota_by_bucket`
+    fresh enough to trust here).
 
     `show_spinner` (v1.6) is threaded through ONLY on the CI-badge branch
     -- quota frames never get a spinner, regardless of this flag. Defaults
     to False so existing callers are unaffected.
     """
-    if frame_name == OVERLAY_FRAME_CI_BADGE:
+    kind = descriptor["kind"]
+    if kind == OVERLAY_FRAME_CI_BADGE:
         if running is None:
             return None
         return {"elements": _build_running_elements(running, timeout_s, show_spinner=show_spinner),
                 "priority": PRIORITY_OVERLAY, "led": None}
-    if frame_name in (OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST):
-        bucket_key = "graphql" if frame_name == OVERLAY_FRAME_QUOTA_GQL else "core"
+    if kind in (OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST):
+        bucket_key = "graphql" if kind == OVERLAY_FRAME_QUOTA_GQL else "core"
         info = (quota_by_bucket or {}).get(bucket_key)
         if info is None:
             return None
         return {"elements": _build_quota_elements(info, timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
+    if kind == OVERLAY_FRAME_FAIL:
+        text = "CI FAIL " + _fail_line(descriptor["repo"], descriptor["run"])
+        return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
+                "priority": PRIORITY_OVERLAY, "led": None}
+    if kind == OVERLAY_FRAME_STUCK:
+        text = "CI stuck " + _fail_line(descriptor["repo"], descriptor["run"])
+        return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
+                "priority": PRIORITY_OVERLAY, "led": None}
+    if kind == OVERLAY_FRAME_GREEN:
+        return {"elements": [_text_element("CI ok", "#00FF00FF", timeout_s)],
+                "priority": PRIORITY_OVERLAY, "led": None}
     return None
+
+
+def build_overlay_sequence(states: list[RepoState], *, running_present: bool,
+                           quota_frames: list[str], show_green: bool) -> list[dict]:
+    """The ordered overlay-tier rotation for this poll: one frame per failing
+    run, then one per stuck run, then the running CI badge (if a run is
+    active), then each available quota frame, then a single quiet-green frame
+    ONLY when nothing else is present and show_green is on. Each fail/stuck
+    descriptor carries its repo and FailingRun so the renderer needs no extra
+    lookup."""
+    seq: list[dict] = []
+    for s in states:
+        for fr in s.failing:
+            seq.append({"kind": OVERLAY_FRAME_FAIL, "repo": s.repo, "run": fr})
+    for s in states:
+        for fr in s.stuck:
+            seq.append({"kind": OVERLAY_FRAME_STUCK, "repo": s.repo, "run": fr})
+    if running_present:
+        seq.append({"kind": OVERLAY_FRAME_CI_BADGE})
+    for frame in quota_frames:
+        seq.append({"kind": frame})
+    if not seq and show_green:
+        seq.append({"kind": OVERLAY_FRAME_GREEN})
+    return seq
 
 
 def _text_element(text: str, color: str, timeout_s: int, font: str = "normal") -> dict:

@@ -5,8 +5,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from ci_status.logic import (
     RepoState, RunningInfo, QuotaInfo, FailingRun, evaluate_runs, build_ci_payload,
-    build_overlay_payload, overlay_frame_sequence,
+    build_overlay_payload, overlay_frame_sequence, build_overlay_sequence,
     OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
+    OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK, OVERLAY_FRAME_GREEN,
     OVERLAY_FRAME_SHAPE,
     _pr_or_branch, select_running_run, compute_median_duration_minutes,
     _format_eta_text, _progress_width, _build_running_title,
@@ -286,7 +287,7 @@ def test_running_title_no_suffix_when_alone():
 def test_overlay_ci_badge_shape():
     run_ = running_run(name="tests", pr_number=42, started_min_ago=3)
     info = running_info(run=run_, median_minutes=14)
-    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=info)
 
     assert payload["priority"] == PRIORITY_OVERLAY == 21
     assert payload["led"] is None
@@ -325,7 +326,7 @@ def test_overlay_ci_badge_shape_no_history_has_no_label():
     # 5-element shape (no "eta_label") is what actually draws.
     run_ = running_run(name="tests", pr_number=42, started_min_ago=3)
     info = running_info(run=run_, median_minutes=None)
-    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=info)
     by_id = _by_id(payload["elements"])
     assert set(by_id) == {"bg", "title", "track", "track_fill", "eta"}
     assert by_id["eta"]["text"] == "3m in"
@@ -333,12 +334,12 @@ def test_overlay_ci_badge_shape_no_history_has_no_label():
 def test_overlay_ci_badge_title_scrolls_when_long():
     run_ = running_run(name="a-very-long-workflow-name-that-will-not-fit", pr_number=12345, started_min_ago=1)
     info = running_info(run=run_, repo="acme/some-long-widgets-repo-name", median_minutes=None)
-    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=info)
     title = _by_id(payload["elements"])["title"]
     assert title.get("scroll_rate") == 2000
 
 def test_overlay_ci_badge_none_when_no_running_info():
-    assert build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=None) is None
+    assert build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=None) is None
 
 
 # --- build_overlay_payload: quota frames ----------------------------------------
@@ -346,7 +347,7 @@ def test_overlay_ci_badge_none_when_no_running_info():
 def test_overlay_quota_gql_shape():
     info = quota_info(label="GITHUB GRAPHQL", limit=5000, remaining=2600, used=2400,
                       reset_epoch=int(NOW.timestamp()) + 42 * 60)
-    payload = build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_GQL}, OVERLAY_DWELL_SECONDS,
                                     quota_by_bucket={"graphql": info})
     assert payload["priority"] == PRIORITY_OVERLAY
 
@@ -366,21 +367,72 @@ def test_overlay_quota_gql_shape():
 
 def test_overlay_quota_rest_uses_core_bucket():
     info = quota_info(label="GITHUB REST", limit=5000, remaining=100, used=4900)
-    payload = build_overlay_payload(OVERLAY_FRAME_QUOTA_REST, OVERLAY_DWELL_SECONDS,
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_REST}, OVERLAY_DWELL_SECONDS,
                                     quota_by_bucket={"core": info})
     by_id = _by_id(payload["elements"])
     assert by_id["title"]["text"] == "GITHUB REST"
     assert by_id["pct"]["text"] == "2%"
 
 def test_overlay_quota_none_when_bucket_missing():
-    assert build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+    assert build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_GQL}, OVERLAY_DWELL_SECONDS,
                                  quota_by_bucket={}) is None
-    assert build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+    assert build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_GQL}, OVERLAY_DWELL_SECONDS,
                                  quota_by_bucket=None) is None
     # Wrong bucket present (core but not graphql) -- still None, not a
     # silent fallback to the wrong data.
-    assert build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+    assert build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_GQL}, OVERLAY_DWELL_SECONDS,
                                  quota_by_bucket={"core": quota_info()}) is None
+
+
+# --- build_overlay_payload: fail/stuck/green frames (descriptor dispatch) -------
+
+def test_fail_frame_is_red_badge_at_overlay_tier():
+    d = {"kind": OVERLAY_FRAME_FAIL, "repo": "o/r", "run": FailingRun("tests", "#42")}
+    payload = build_overlay_payload(d, OVERLAY_DWELL_SECONDS)
+    assert payload["priority"] == PRIORITY_OVERLAY
+    assert _bg_element(payload["elements"])["fill_colors"] == ["#A32D2DFF"]
+    t = _text_element(payload["elements"])
+    assert t["text"] == "CI FAIL o/r #42 · tests" and t["color"] == "#FFFFFFFF"
+
+def test_fail_frame_drops_ref_when_empty():
+    d = {"kind": OVERLAY_FRAME_FAIL, "repo": "o/r", "run": FailingRun("tests", "")}
+    assert _text_element(build_overlay_payload(d, 10)["elements"])["text"] == "CI FAIL o/r · tests"
+
+def test_stuck_frame_is_amber_badge_at_overlay_tier():
+    d = {"kind": OVERLAY_FRAME_STUCK, "repo": "o/r", "run": FailingRun("deploy", "#7")}
+    payload = build_overlay_payload(d, 10)
+    assert payload["priority"] == PRIORITY_OVERLAY
+    assert _bg_element(payload["elements"])["fill_colors"] == ["#BA7517FF"]
+    assert _text_element(payload["elements"])["text"] == "CI stuck o/r #7 · deploy"
+
+def test_green_frame_is_quiet_text_at_overlay_tier():
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_GREEN}, 10)
+    assert payload["priority"] == PRIORITY_OVERLAY
+    assert _text_element(payload["elements"])["color"] == "#00FF00FF"
+    assert not any(e["type"] == "rectangle" for e in payload["elements"])
+
+def test_sequence_orders_fail_then_stuck_then_badge_then_quota():
+    states = [RepoState("o/r", [FailingRun("a", "#1")], [FailingRun("b", "#2")])]
+    seq = build_overlay_sequence(states, running_present=True,
+                                 quota_frames=[OVERLAY_FRAME_QUOTA_GQL], show_green=False)
+    assert [d["kind"] for d in seq] == [
+        OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK, OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL]
+    assert seq[0]["run"] == FailingRun("a", "#1") and seq[0]["repo"] == "o/r"
+
+def test_sequence_one_frame_per_failing_run():
+    states = [RepoState("o/r", [FailingRun("a", ""), FailingRun("b", "")], [])]
+    seq = build_overlay_sequence(states, running_present=False, quota_frames=[], show_green=False)
+    assert [d["kind"] for d in seq] == [OVERLAY_FRAME_FAIL, OVERLAY_FRAME_FAIL]
+
+def test_sequence_green_only_when_otherwise_empty():
+    empty = [RepoState("o/r", [], [])]
+    assert [d["kind"] for d in build_overlay_sequence(empty, running_present=False, quota_frames=[], show_green=True)] == [OVERLAY_FRAME_GREEN]
+    # green suppressed when other content exists
+    busy = [RepoState("o/r", [FailingRun("a", "")], [])]
+    assert OVERLAY_FRAME_GREEN not in [d["kind"] for d in build_overlay_sequence(busy, running_present=False, quota_frames=[], show_green=True)]
+
+def test_sequence_empty_when_nothing_and_green_off():
+    assert build_overlay_sequence([RepoState("o/r", [], [])], running_present=False, quota_frames=[], show_green=False) == []
 
 
 # --- headroom color thresholds (boundaries 50/20) -------------------------------
@@ -470,20 +522,20 @@ def test_overlay_frame_shape_distinguishes_badge_from_quota():
 # --- build_ci_payload: overlay precedence ---------------------------------------
 
 def test_payload_overlay_takes_priority_over_quiet_green():
-    overlay = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=running_info())
+    overlay = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=running_info())
     payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=overlay)
     assert payload["priority"] == PRIORITY_OVERLAY   # overlay beats show_green
     assert payload is overlay
 
 def test_payload_failure_takes_priority_over_overlay():
-    overlay = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=running_info())
+    overlay = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=running_info())
     payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "")], [])], False, 180, overlay=overlay)
     assert payload["priority"] == PRIORITY_ALERT   # failure wins, not the overlay
     bg = _bg_element(payload["elements"])
     assert bg["fill_colors"] == ["#A32D2DFF"]
 
 def test_payload_stuck_takes_priority_over_overlay():
-    overlay = build_overlay_payload(OVERLAY_FRAME_QUOTA_GQL, OVERLAY_DWELL_SECONDS,
+    overlay = build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_GQL}, OVERLAY_DWELL_SECONDS,
                                     quota_by_bucket={"graphql": quota_info()})
     payload = build_ci_payload([RepoState("o/r", [], [FailingRun("tests", "")])], False, 180, overlay=overlay)
     assert payload["priority"] == PRIORITY_ALERT
@@ -607,7 +659,7 @@ def test_eta_label_excluded_on_no_history_elapsed_form():
 def test_eta_label_x_position_follows_eta_text_width():
     run_ = running_run(name="tests", pr_number=42, started_min_ago=1)
     info = running_info(run=run_, median_minutes=60)   # eta = 59m -> "~59m", label fits
-    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=info)
     by_id = _by_id(payload["elements"])
     eta_text = by_id["eta"]["text"]
     assert by_id["eta_label"]["x"] == RUNNING_NUMERAL_X + _text_width_px(eta_text) + RUNNING_LABEL_GAP_PX
@@ -617,7 +669,7 @@ def test_eta_label_x_position_follows_eta_text_width():
 def test_eta_label_falls_back_to_left_end_to_end_through_build_overlay_payload():
     run_ = running_run(name="tests", pr_number=42, started_min_ago=0)
     info = running_info(run=run_, median_minutes=60)   # eta = 60m -> "~1h00m"
-    payload = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, OVERLAY_DWELL_SECONDS, running=info)
+    payload = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=info)
     by_id = _by_id(payload["elements"])
     assert by_id["eta"]["text"] == "~1h00m"
     assert by_id["eta_label"]["text"] == "left"
@@ -860,7 +912,7 @@ def _running():
 
 
 def test_spinner_present_and_title_reserved_when_on():
-    p = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, 10, running=_running(), show_spinner=True)
+    p = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, 10, running=_running(), show_spinner=True)
     els = p["elements"]
     spin = next(e for e in els if e["id"] == RUN_SPINNER_ID)
     assert spin["type"] == "animation" and spin["stock_path"] == "shared/spinner_front_8x8.anim"
@@ -869,7 +921,7 @@ def test_spinner_present_and_title_reserved_when_on():
     assert title["width"] == 60   # reserved so the scrolling title never runs under the spinner
 
 def test_no_spinner_and_full_title_when_off():
-    p = build_overlay_payload(OVERLAY_FRAME_CI_BADGE, 10, running=_running(), show_spinner=False)
+    p = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, 10, running=_running(), show_spinner=False)
     els = p["elements"]
     assert not any(e["id"] == RUN_SPINNER_ID for e in els)
     assert next(e for e in els if e["id"] == "title")["width"] == 68  # unchanged
