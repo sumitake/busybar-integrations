@@ -147,7 +147,7 @@ Matching the poll to the dwell gap exactly (10s) did not eliminate the dark gaps
 
 ## Escalation ladder
 
-An operator-reported UX gap: a persistent CI failure alert (`ci_status`, `PRIORITY_ALERT`) permanently evicted the calendar, hiding an imminent event with no way for the calendar to ever reclaim the screen -- the ambient tier has no dwell/silence contract of its own the way the overlay tier does. v1.5.2's fix is a state-dependent draw priority: as an upcoming event gets closer, the calendar climbs `busybar/display.py`'s shared priority ladder so it can no longer be silently buried, first by the overlay-tier CI badge/quota rotation and then by a genuine alert itself.
+An operator-reported UX gap: a persistent CI failure alert (`ci_status`, then drawn at `PRIORITY_ALERT`) permanently evicted the calendar, hiding an imminent event with no way for the calendar to ever reclaim the screen -- the ambient tier has no dwell/silence contract of its own the way the overlay tier does. v1.5.2's fix is a state-dependent draw priority: as an upcoming event gets closer, the calendar climbs `busybar/display.py`'s shared priority ladder so it can no longer be silently buried by the overlay-tier rotation. (As of the calm-rotation change, `ci_status` no longer draws at `PRIORITY_ALERT` at all -- its failure/stuck frames now rotate at the overlay tier (21) alongside the running badge and quota gauges, so the calendar's climb above that tier is what keeps an imminent event visible.)
 
 **Assumed ordering.** The four thresholds are assumed to nest:
 `approach_minutes > notice_minutes > warn_minutes >= imminent_minutes`.
@@ -163,8 +163,8 @@ of these four keys.
 | Window | Priority | Palette | LED | Notes |
 |---|---|---|---|---|
 | `normal` (beyond `approach_minutes`) | `PRIORITY_AMBIENT` (20) | normal | off | Baseline, unchanged from before v1.5.2. |
-| `approach` (within `approach_minutes`, outside `notice_minutes`) | `PRIORITY_AMBIENT_RAISED` (25) | normal (unchanged) | off | Strictly above the overlay tier (21) -- the countdown can no longer be silently interrupted by the running-CI badge/quota rotation, but a genuine alert (60) still wins. Purely a priority change; nothing looks different on screen. |
-| `notice` (within `notice_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | amber | off | Strictly above `PRIORITY_ALERT` (60) -- a persistent CI failure/stuck alert no longer permanently buries an imminent event. |
+| `approach` (within `approach_minutes`, outside `notice_minutes`) | `PRIORITY_AMBIENT_RAISED` (25) | normal (unchanged) | off | Strictly above the overlay tier (21) -- the countdown can no longer be silently interrupted by the CI rotation (failure/stuck/running/quota frames all draw there). Purely a priority change; nothing looks different on screen. |
+| `notice` (within `notice_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | amber | off | Above the overlay tier (21) where `ci_status`'s failure/stuck frames now draw, so an imminent event is never buried by a CI failure (and above the now-unused `PRIORITY_ALERT` (60) slot). |
 | `warn` (within `warn_minutes`) | `PRIORITY_AMBIENT_URGENT` (65) | red | off | Same priority as `notice` -- they differ visually and (below) in LED, not in urgency toward the display arbitration. |
 | *imminent window* (within `imminent_minutes`, part of `warn`) | `PRIORITY_AMBIENT_URGENT` (65) | red (same as `warn`) | **on**, every draw | Not a separate priority tier -- `imminent_minutes` governs only the LED. See "Audio and LED" below. |
 | `in_progress` | `PRIORITY_AMBIENT` (20) | teal | off | Deliberately NOT elevated -- once a meeting has started you already know about it (you're either in it or conspicuously not); the elevation exists to catch your attention *before* an event starts, not to keep fighting for the screen once it has. An alert regains the panel here exactly as it did before this feature existed. |
