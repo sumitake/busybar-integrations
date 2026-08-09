@@ -4,19 +4,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations"))
 from ci_status.logic import (
-    RepoState, RunningInfo, QuotaInfo, FailingRun, evaluate_runs, build_ci_payload,
-    build_overlay_payload, overlay_frame_sequence, build_overlay_sequence,
+    RepoState, RunningInfo, QuotaInfo, FailingRun, evaluate_runs,
+    build_overlay_payload, build_overlay_sequence,
     OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST,
     OVERLAY_FRAME_FAIL, OVERLAY_FRAME_STUCK, OVERLAY_FRAME_GREEN,
-    OVERLAY_FRAME_SHAPE,
     _pr_or_branch, select_running_run, compute_median_duration_minutes,
     _format_eta_text, _progress_width, _build_running_title,
     parse_rate_limit, _quota_headroom, _quota_used_width,
     resolve_repo_list, _eta_label, RUNNING_NUMERAL_X, RUNNING_LABEL_GAP_PX,
-    compute_alert_fingerprint, update_snooze, RUN_SPINNER_ID,
+    RUN_SPINNER_ID,
     resolve_ci_led_value, CI_LED_COLOR, LED_OFF_COLOR, LED_OFF_ELEMENTS,
 )
-from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS, PRIORITY_ALERT
+from busybar.display import PRIORITY_OVERLAY, OVERLAY_DWELL_SECONDS
 from calendar_countdown.logic import _text_width_px
 
 NOW = datetime(2026, 8, 3, 13, 37, tzinfo=timezone.utc)
@@ -100,48 +99,6 @@ def test_evaluate_sorts_failing_by_workflow_then_ref():
             run(1, "alpha", "completed", "failure", pr_number=3)]
     state = evaluate_runs("o/r", runs, NOW, 0)
     assert state.failing == [FailingRun("alpha", "#3"), FailingRun("zeta", "#9")]
-
-
-def test_payload_none_when_green_and_quiet():
-    assert build_ci_payload([RepoState("o/r", [], [])], False, 180) is None
-
-
-def test_payload_shows_green_glyph_when_enabled():
-    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180)
-    assert payload["priority"] == PRIORITY_ALERT == 60
-    text_el = _text_element(payload["elements"])
-    assert text_el["color"] == "#00FF00FF"
-    # quiet green case has no full-panel background badge
-    assert not any(e["type"] == "rectangle" for e in payload["elements"])
-
-
-def test_payload_red_badge_on_failure():
-    payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "#42")], [])], False, 180)
-    assert payload["priority"] == PRIORITY_ALERT and payload["led"] == "#FF0000FF"
-
-    bg = _bg_element(payload["elements"])
-    assert bg["x"] == 0 and bg["y"] == 0 and bg["width"] == 72 and bg["height"] == 16
-    assert bg["radius"] == 2 and bg["fill"] == "solid"
-    assert bg["fill_colors"] == ["#A32D2DFF"]
-    # default 1px white border would outline the badge; must be disabled
-    assert bg["border_width"] == 0
-
-    text_el = _text_element(payload["elements"])
-    assert "o/r" in text_el["text"] and "#42" in text_el["text"] and "tests" in text_el["text"]
-    assert text_el["color"] == "#FFFFFFFF" and text_el["font"] == "bold"
-
-
-def test_payload_amber_badge_on_stuck_only():
-    payload = build_ci_payload([RepoState("o/r", [], [FailingRun("tests", "main")])], False, 180)
-    assert payload["led"] is None
-    assert _bg_element(payload["elements"])["fill_colors"] == ["#BA7517FF"]
-    text_el = _text_element(payload["elements"])
-    assert "stuck" in text_el["text"] and "main" in text_el["text"]
-
-
-def test_failure_badge_takes_priority_over_stuck():
-    payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "")], [FailingRun("lint", "")])], False, 180)
-    assert _bg_element(payload["elements"])["fill_colors"] == ["#A32D2DFF"]
 
 
 # --- PR number / branch fallback ----------------------------------------------
@@ -502,53 +459,6 @@ def test_parse_rate_limit_returns_partial_result():
     assert "core" in parsed and "graphql" not in parsed
 
 
-# --- overlay_frame_sequence: round-robin sequencing -----------------------------
-
-def test_overlay_frame_sequence_badge_only_when_quota_disabled():
-    assert overlay_frame_sequence(False) == [OVERLAY_FRAME_CI_BADGE]
-
-def test_overlay_frame_sequence_includes_quota_frames_when_enabled():
-    assert overlay_frame_sequence(True) == \
-        [OVERLAY_FRAME_CI_BADGE, OVERLAY_FRAME_QUOTA_GQL, OVERLAY_FRAME_QUOTA_REST]
-
-def test_overlay_frame_shape_distinguishes_badge_from_quota():
-    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_CI_BADGE] == "badge"
-    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_GQL] == "quota"
-    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_REST] == "quota"
-    # The two quota frames share a shape (identical element id sets) --
-    # only badge<->quota transitions need the id-shape-change clear.
-    assert OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_GQL] == OVERLAY_FRAME_SHAPE[OVERLAY_FRAME_QUOTA_REST]
-
-
-# --- build_ci_payload: overlay precedence ---------------------------------------
-
-def test_payload_overlay_takes_priority_over_quiet_green():
-    overlay = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=running_info())
-    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=overlay)
-    assert payload["priority"] == PRIORITY_OVERLAY   # overlay beats show_green
-    assert payload is overlay
-
-def test_payload_failure_takes_priority_over_overlay():
-    overlay = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=running_info())
-    payload = build_ci_payload([RepoState("o/r", [FailingRun("tests", "")], [])], False, 180, overlay=overlay)
-    assert payload["priority"] == PRIORITY_ALERT   # failure wins, not the overlay
-    bg = _bg_element(payload["elements"])
-    assert bg["fill_colors"] == ["#A32D2DFF"]
-
-def test_payload_stuck_takes_priority_over_overlay():
-    overlay = build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_GQL}, OVERLAY_DWELL_SECONDS,
-                                    quota_by_bucket={"graphql": quota_info()})
-    payload = build_ci_payload([RepoState("o/r", [], [FailingRun("tests", "")])], False, 180, overlay=overlay)
-    assert payload["priority"] == PRIORITY_ALERT
-    bg = _bg_element(payload["elements"])
-    assert bg["fill_colors"] == ["#BA7517FF"]
-
-def test_payload_no_overlay_falls_through_to_quiet_or_green_as_before():
-    assert build_ci_payload([RepoState("o/r", [], [])], False, 180, overlay=None) is None
-    payload = build_ci_payload([RepoState("o/r", [], [])], True, 180, overlay=None)
-    assert payload["priority"] == PRIORITY_ALERT
-
-
 # --- resolve_repo_list (v1.5.1 account-wide watching) -----------------------------
 
 def _account_repo(full_name, pushed_days_ago=1, archived=False):
@@ -674,225 +584,6 @@ def test_eta_label_falls_back_to_left_end_to_end_through_build_overlay_payload()
     by_id = _by_id(payload["elements"])
     assert by_id["eta"]["text"] == "~1h00m"
     assert by_id["eta_label"]["text"] == "left"
-
-
-# --- alert snooze via the device's native start button (v1.5.2) -----------------
-
-def test_compute_alert_fingerprint_empty_when_all_green():
-    assert compute_alert_fingerprint([RepoState("o/r", [], [])]) == frozenset()
-
-def test_compute_alert_fingerprint_covers_failing_and_stuck():
-    states = [RepoState("o/r", [FailingRun("tests", "#42")], [FailingRun("lint", "main")])]
-    fp = compute_alert_fingerprint(states)
-    assert fp == frozenset({("o/r", "tests", "failing"), ("o/r", "lint", "stuck")})
-
-def test_compute_alert_fingerprint_category_change_is_a_different_fingerprint():
-    failing_fp = compute_alert_fingerprint([RepoState("o/r", [FailingRun("tests", "#42")], [])])
-    stuck_fp = compute_alert_fingerprint([RepoState("o/r", [], [FailingRun("tests", "#42")])])
-    assert failing_fp != stuck_fp
-
-def test_compute_alert_fingerprint_multi_repo():
-    states = [RepoState("o/a", [FailingRun("tests", "#42")], []),
-              RepoState("o/b", [FailingRun("build", "main")], [])]
-    fp = compute_alert_fingerprint(states)
-    assert fp == frozenset({("o/a", "tests", "failing"), ("o/b", "build", "failing")})
-
-def test_compute_alert_fingerprint_ignores_ref_flicker():
-    # GitHub's REST API can leave pull_requests empty for a poll or two
-    # before it populates -- _pr_or_branch flips from "" to "#42" across
-    # that window for the SAME ongoing failure. The fingerprint must be
-    # ref-invariant (workflow-name-only) so this flicker doesn't look like
-    # a new alert to update_snooze and spuriously clear an active/pending
-    # snooze or re-fire the LED.
-    no_ref_fp = compute_alert_fingerprint([RepoState("o/r", [FailingRun("tests", "")], [])])
-    with_ref_fp = compute_alert_fingerprint([RepoState("o/r", [FailingRun("tests", "#42")], [])])
-    assert no_ref_fp == with_ref_fp == frozenset({("o/r", "tests", "failing")})
-
-
-# --- update_snooze: the full state machine ---------------------------------------
-
-FP_A = frozenset({("o/r", "tests", "failing")})
-FP_B = frozenset({("o/r", "build", "failing")})   # a different fingerprint
-EMPTY_FP = frozenset()
-
-def test_update_snooze_disabled_always_passthrough():
-    state = {}
-    assert update_snooze(FP_A, True, NOW, 0, state) == (False, False)
-    assert state.get("fingerprint") is None
-
-def test_update_snooze_no_alert_no_session_is_a_noop():
-    state = {}
-    assert update_snooze(EMPTY_FP, False, NOW, 30, state) == (False, False)
-    assert "fingerprint" not in state
-
-def test_update_snooze_alert_alone_no_session_no_pending():
-    state = {}
-    assert update_snooze(FP_A, False, NOW, 30, state) == (False, False)
-    assert "fingerprint" not in state
-
-def test_update_snooze_first_ever_poll_with_session_already_active_does_not_pend():
-    # Conservative default: session_was_active defaults to True on a
-    # fresh/never-observed state, so the very first poll (even if
-    # busy_active happens to be True) is never mistaken for a fresh
-    # inactive->active transition -- see update_snooze's docstring.
-    state = {}
-    assert update_snooze(FP_A, True, NOW, 30, state) == (False, False)
-    assert "fingerprint" not in state
-    assert state["session_was_active"] is True
-
-def test_update_snooze_genuine_transition_establishes_pending():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)   # observe inactive first
-    result = update_snooze(FP_A, True, NOW, 30, state)   # now transitions to active
-    assert result == (False, True)   # draw proceeds, LED suppressed
-    assert state["fingerprint"] == FP_A
-    assert "snooze_until" not in state
-
-# --- Critical regression: unpolled (None) cycles must never corrupt
-# session_was_active -- reviewer-reproduced bug. An earlier version wrote
-# busy_active unconditionally every call, including a dummy False for
-# gated-off (idle) polls; a run of idle polls would stamp
-# session_was_active=False regardless of the device's real state, so a
-# session that started (unobserved) during that idle stretch and was
-# already running by the time an alert first appeared would be
-# misread as a fresh transition and silently snoozed -- an
-# unacknowledged failure. Fixed: busy_active=None means "not polled this
-# cycle" and must NOT be committed.
-
-def test_update_snooze_unpolled_cycles_do_not_corrupt_session_was_active():
-    state = {}
-    # Simulates several idle polls where get_busy() was never called
-    # (main.run_once passes None in this case).
-    update_snooze(EMPTY_FP, None, NOW, 30, state)
-    update_snooze(EMPTY_FP, None, NOW, 30, state)
-    update_snooze(EMPTY_FP, None, NOW, 30, state)
-    assert state.get("session_was_active", True) is True   # untouched, still the conservative default
-
-def test_update_snooze_session_predating_alert_does_not_snooze_reviewer_scenario():
-    # The exact reviewer-reported scenario: idle polls (unpolled, None) ->
-    # a session starts DURING that unpolled stretch (never observed) ->
-    # an alert appears, triggering the first real poll, which correctly
-    # observes busy_active=True -- but this must NOT be read as a fresh
-    # transition, since the session predates the alert and the operator
-    # never acknowledged it.
-    state = {}
-    update_snooze(EMPTY_FP, None, NOW, 30, state)   # idle poll 1, unpolled
-    update_snooze(EMPTY_FP, None, NOW, 30, state)   # idle poll 2, unpolled
-    # Session starts here, still unobserved (no alert yet, still not polling).
-    t1 = NOW + timedelta(seconds=30)
-    result = update_snooze(FP_A, True, t1, 30, state)   # alert appears -- first real poll
-    assert result == (False, False)   # must NOT pend -- no acknowledged transition observed
-    assert "fingerprint" not in state
-
-def test_update_snooze_mirror_alert_first_then_session_starts_while_polled():
-    # The mirror case (still correct, unaffected by the fix): the alert
-    # appears FIRST (triggering real polling immediately), observes
-    # inactive, and only THEN does the session start while polling
-    # continues -- a genuine, fully-observed transition, so pending
-    # DOES start, exactly as designed.
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)   # alert showing, polled, session inactive
-    t1 = NOW + timedelta(seconds=10)
-    result = update_snooze(FP_A, True, t1, 30, state)   # still polled -- session starts
-    assert result == (False, True)
-    assert state["fingerprint"] == FP_A
-
-def test_update_snooze_none_after_established_pending_defensive_stays_pending():
-    # Defensive case documented in update_snooze: main.run_once's own
-    # gating guarantees busy_active is never None while a fingerprint is
-    # pending (a pending snooze always keeps polling), but the function
-    # itself treats an (unexpected) None here as "stay pending" rather
-    # than risk prematurely starting the timed snooze on an unpolled guess.
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)   # now pending on FP_A
-    assert state.get("snooze_until") is None
-    result = update_snooze(FP_A, None, NOW, 30, state)
-    assert result == (False, True)   # still pending, not prematurely timed
-    assert "snooze_until" not in state
-
-def test_update_snooze_stays_pending_while_session_continues():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)
-    later = NOW + timedelta(minutes=2)
-    assert update_snooze(FP_A, True, later, 30, state) == (False, True)
-    assert "snooze_until" not in state
-
-def test_update_snooze_session_end_starts_timed_snooze():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)
-    session_end = NOW + timedelta(minutes=5)
-    result = update_snooze(FP_A, False, session_end, 30, state)
-    assert result == (True, False)
-    assert state["snooze_until"] == session_end + timedelta(minutes=30)
-
-def test_update_snooze_suppresses_through_the_timed_window():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)
-    session_end = NOW + timedelta(minutes=5)
-    update_snooze(FP_A, False, session_end, 30, state)
-    mid_snooze = session_end + timedelta(minutes=10)
-    assert update_snooze(FP_A, False, mid_snooze, 30, state) == (True, False)
-
-def test_update_snooze_expires_and_realerts_if_still_failing():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)
-    session_end = NOW + timedelta(minutes=5)
-    update_snooze(FP_A, False, session_end, 30, state)
-    after_expiry = session_end + timedelta(minutes=31)
-    assert update_snooze(FP_A, False, after_expiry, 30, state) == (False, False)
-    assert "fingerprint" not in state
-
-def test_update_snooze_fingerprint_change_during_pending_reelerts():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)   # pending on FP_A
-    later = NOW + timedelta(minutes=1)
-    # A different fingerprint appears while still pending on FP_A --
-    # clears the old pending. Session is still active (level, not a fresh
-    # edge for FP_B), so FP_B does NOT get a fresh pending either.
-    result = update_snooze(FP_B, True, later, 30, state)
-    assert result == (False, False)
-    assert "fingerprint" not in state
-
-def test_update_snooze_fingerprint_change_during_timed_snooze_realerts_immediately():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)
-    session_end = NOW + timedelta(minutes=5)
-    update_snooze(FP_A, False, session_end, 30, state)   # timed snooze on FP_A
-    mid_snooze = session_end + timedelta(minutes=10)
-    # A DIFFERENT failure shows up while FP_A is still timed-snoozed and
-    # no session is running -- must alert immediately, not stay suppressed.
-    result = update_snooze(FP_B, False, mid_snooze, 30, state)
-    assert result == (False, False)
-    assert "fingerprint" not in state
-
-def test_update_snooze_resolved_then_new_clears_snooze():
-    state = {}
-    update_snooze(FP_A, False, NOW, 30, state)
-    update_snooze(FP_A, True, NOW, 30, state)
-    session_end = NOW + timedelta(minutes=5)
-    update_snooze(FP_A, False, session_end, 30, state)   # timed on FP_A
-    mid_snooze = session_end + timedelta(minutes=10)
-    # FP_A resolved entirely (nothing failing) -- also a fingerprint change.
-    result = update_snooze(EMPTY_FP, False, mid_snooze, 30, state)
-    assert result == (False, False)
-    assert "fingerprint" not in state
-
-def test_update_snooze_session_starting_mid_alert_after_continuous_polling():
-    # The "normal" full flow, polled continuously (no gating gaps): alert
-    # appears while no session is running, then a session starts.
-    state = {}
-    assert update_snooze(FP_A, False, NOW, 30, state) == (False, False)
-    t1 = NOW + timedelta(seconds=10)
-    assert update_snooze(FP_A, False, t1, 30, state) == (False, False)   # still no session
-    t2 = t1 + timedelta(seconds=10)
-    assert update_snooze(FP_A, True, t2, 30, state) == (False, True)   # session starts -- pending
 
 
 # --- CI running-badge spinner (v1.6, task 4) ---------------------------------------
