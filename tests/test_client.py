@@ -601,3 +601,37 @@ def test_empty_owner_cannot_turn_cleanup_into_global_delete(mock_request):
     with pytest.raises(ValueError):
         client.remove_elements("", ["old"])
     mock_request.assert_not_called()
+
+
+@patch("busybar.client.requests.request")
+@pytest.mark.parametrize("audio", [False, True])
+def test_newly_discovered_address_is_tried_in_current_operation(mock_request, audio):
+    from busybar.discovery import DiscoveredDevice
+    client = BusyBarClient()
+    client.discover = True
+    client.device_id = "aabbccddeeff"
+    record = DiscoveredDevice(client.device_id, "busybar-aabbccddeeff._http._tcp.local.", ("192.0.2.9",), 80)
+    # Only a definite connection timeout permits retrying the audio variant.
+    mock_request.side_effect = [requests.ConnectTimeout(), _response(200, {"api_semver": "27.5.0"})]
+    with patch("busybar.discovery.discover_devices", return_value=[record]) as scan:
+        result = client.play_audio("app", stock_path="sound.snd") if audio else client.get_json("/api/version")
+    assert result
+    assert mock_request.call_count == 2
+    assert mock_request.call_args.args[1].startswith("http://192.0.2.9/")
+    scan.assert_called_once()
+
+
+@patch("busybar.client.requests.request")
+def test_discovery_refresh_cannot_exceed_four_attempts_or_replay_uncertain_audio(mock_request):
+    client = BusyBarClient(fallback_hosts=["192.0.2.1", "192.0.2.2", "192.0.2.3"])
+    mock_request.side_effect = requests.ConnectTimeout()
+    with patch.object(client, "_refresh_discovery") as scan:
+        assert client.get_json("/api/version") is None
+    assert mock_request.call_count == 4
+    scan.assert_called_once()
+    mock_request.reset_mock()
+    mock_request.side_effect = requests.ReadTimeout()
+    with patch.object(client, "_refresh_discovery") as scan:
+        assert client.play_audio("app", stock_path="sound.snd") is False
+    assert mock_request.call_count == 1
+    scan.assert_not_called()

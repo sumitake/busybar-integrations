@@ -164,3 +164,18 @@ def test_requested_screen_failure_makes_cli_incomplete(monkeypatch, capsys, tmp_
     report = json.loads(capsys.readouterr().out)
     assert report["complete"] is False
     assert report["features"]["screen"]["available"] is False
+
+
+def test_explicit_host_is_local_and_disables_configured_alternatives(monkeypatch):
+    from busybar.__main__ import _client
+    from busybar.config import DEFAULTS
+    from copy import deepcopy
+    config = deepcopy(DEFAULTS)
+    config["device"].update(transport="cloud", fallback_hosts=["192.0.2.8"],
+                            discover=True, device_id="aabbccddeeff", local_token="local-only")
+    monkeypatch.setattr("busybar.__main__.load_config", lambda path: config)
+    client = _client(None, "192.0.2.9")
+    assert client.transport == "local"
+    assert client._all_local_hosts() == ["192.0.2.9"]
+    assert client.discover is False
+    assert client.local_token == "local-only"

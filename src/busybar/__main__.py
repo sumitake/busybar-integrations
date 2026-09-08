@@ -16,7 +16,9 @@ def _client(config_path: str | None, host: str | None) -> BusyBarClient:
     config = load_config(Path(config_path) if config_path else None)
     kwargs = device_kwargs(config)
     if host:
-        kwargs["host"] = host
+        # An explicit diagnostic target must not silently select another bar
+        # or inherit a forced-cloud mode from the integration configuration.
+        kwargs.update(host=host, transport="local", fallback_hosts=[], discover=False)
     return BusyBarClient(**kwargs)
 
 

@@ -7,7 +7,7 @@ commit `2cd7ec8abf8479ba3398241e99d291ec24f2a96f`.
 ## Automated checks
 
 - Existing baseline: 374 passing tests.
-- Implementation: 423 passing tests, including existing calendar/CI/Nyan
+- Implementation: 427 passing tests, including existing calendar/CI/Nyan
   behavior and new transport, discovery, presentation and diagnostic cases.
 - Source distribution and wheel built successfully with `uv build`.
 - Python compilation and `git diff --check` passed.
@@ -67,6 +67,15 @@ were fixed: modern bitmap-only support without empty cloud fallback, honest
 unavailable discovery reporting, and positive finite HA notification TTLs.
 Primary review also corrected firmware wire contracts against source and live
 responses and rejected a broker/transaction layer as unnecessary.
+
+The first complete GitHub review batch on PR #22 (head `db05fce`, inventory
+cutoff 2026-09-08 21:56 UTC) contained two actionable P2 findings. Both were
+fixed together: explicit diagnostic `--host` now forces that sole local target,
+and discovery may append newly found addresses during the current operation
+without exceeding four total attempts or replaying an uncertain write. Tests
+and live reads verified both corrections. Formal reviews, all inline threads,
+issue comments and applicable check annotations were inventoried before the
+patch; CodeRabbit's skipped review was not counted as approval.
 
 A logical Gemini final repository advisory returned **PROCEED**. The earlier
 follow-up design call was unavailable because of nested host sandbox failure;

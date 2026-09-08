@@ -167,7 +167,8 @@ class BusyBarClient:
         headers = dict(kwargs.pop("headers", None) or {})
         if self.local_token:
             headers["X-API-Token"] = self.local_token
-        for route in routes:
+        refreshed = False
+        for attempt, route in enumerate(routes):
             try:
                 response = requests.request(
                     method, f"{self._base_for(route)}{path}", timeout=self.timeout,
@@ -186,7 +187,15 @@ class BusyBarClient:
                 return response, None
             if not replay_safe and not isinstance(failure, requests.ConnectTimeout):
                 return None, failure
-        self._refresh_discovery()
+            if attempt == len(routes) - 1 and not refreshed:
+                # Refresh once after exhausting stale routes. Append only new
+                # addresses that fit this operation's original four-attempt
+                # budget. Uncertain writes return above, before discovery.
+                self._refresh_discovery()
+                refreshed = True
+                for candidate in self._local_order():
+                    if candidate not in routes and len(routes) < 4:
+                        routes.append(candidate)
         return None, failure
 
     def _try_cloud(self, method: str, path: str, **kwargs: Any) -> requests.Response | None:

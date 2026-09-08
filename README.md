@@ -74,6 +74,11 @@ uv run python -m busybar diagnose
 uv run python -m busybar diagnose --host 10.0.4.20 --screen screen.bmp
 ```
 
+If a macOS editable install reports `No module named busybar` (Python can
+ignore a `.pth` file marked hidden), run from the repository root with
+`PYTHONPATH=src uv run python -m busybar diagnose`. This uses the same source
+modules without relying on the editable-install file.
+
 Diagnostics read firmware/API versions, local transport, power and BUSY
 snapshot availability. They never dump tokens/configuration, play audio,
 start timers, or write device logs. An incomplete report exits nonzero.
