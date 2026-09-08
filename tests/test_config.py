@@ -37,6 +37,12 @@ def test_env_overrides_file(tmp_path, monkeypatch):
     monkeypatch.setenv("BUSYBAR_HOST", "192.0.2.99")
     assert load_config(p)["device"]["host"] == "192.0.2.99"
 
+def test_local_token_env_overrides_file(tmp_path, monkeypatch):
+    p = tmp_path / "config.toml"
+    p.write_text('[device]\nlocal_token = "file-token"\n')
+    monkeypatch.setenv("BUSYBAR_LOCAL_TOKEN", "env-token")
+    assert load_config(p)["device"]["local_token"] == "env-token"
+
 def test_returned_config_mutation_does_not_corrupt_defaults(tmp_path):
     # Mutate the returned config in place
     cfg1 = load_config(tmp_path / "missing.toml")
@@ -130,3 +136,4 @@ def test_animation_accent_defaults(tmp_path):
     assert cal["start_animation"] == "meeting_72x16"
     assert cal["start_window_seconds"] == 60
     assert cfg["ci_status"]["running_spinner"] is True
+    assert cfg["ci_status"]["bitmap_icons"] is True

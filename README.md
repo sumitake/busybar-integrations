@@ -19,7 +19,7 @@ Per-integration extras (e.g., macOS Calendar access for `calendar_countdown`) ar
 
 1. Clone the repo:
    ```bash
-   git clone https://github.com/your-org/busybar-integrations.git
+   git clone https://github.com/sumitake/busybar-integrations.git
    cd busybar-integrations
    ```
 
@@ -43,6 +43,105 @@ Per-integration extras (e.g., macOS Calendar access for `calendar_countdown`) ar
    ```bash
    uv run python -m ci_status.main --once --dry-run
    ```
+
+## Firmware 1.2.3 support
+
+The local API is capability-probed through `GET /api/version` (`api_semver`).
+API **27.5.0+** enables selective element cleanup, explicit drawing order
+(`z_index`), and small inline XPM2 CI icons. Older/unknown firmware and cloud
+relay retain the ordinary text/shape payloads. No new configuration is needed
+for these display improvements; `[ci_status] bitmap_icons = false` disables
+the cosmetic icons.
+
+Calendar and CI still send complete, expiring frames on their established
+cadence. At a same-priority layout change, selective cleanup removes obsolete
+IDs while keeping common content visible. Type changes and priority reductions
+use an app-scoped full clear. Neither path is an atomic frame transaction;
+timeouts and subsequent full redraws provide recovery after preemption or a
+failed request. Firmware 1.2.3 has an application-name parsing bug in the
+selective DELETE body, so this client always puts ownership in the query.
+
+The large calendar countdown and device-native Nyan animation remain in use.
+The firmware's native countdown font is too small for the existing calendar
+layout; Nyan already plays its uploaded animation on the bar. Firmware fixes
+for Wi-Fi status streaming and networking benefit the existing local API
+without adding another background listener.
+
+### Inspect the device
+
+```bash
+uv run python -m busybar diagnose
+uv run python -m busybar diagnose --host 10.0.4.20 --screen screen.bmp
+```
+
+If a macOS editable install reports `No module named busybar` (Python can
+ignore a `.pth` file marked hidden), run from the repository root with
+`PYTHONPATH=src uv run python -m busybar diagnose`. This uses the same source
+modules without relying on the editable-install file.
+
+Diagnostics read firmware/API versions, local transport, power and BUSY
+snapshot availability. They never dump tokens/configuration, play audio,
+start timers, or write device logs. An incomplete report exits nonzero.
+Screen capture converts firmware 1.2.3's base64 BGR framebuffer into a standard
+BMP; the endpoint's `image/bmp` header does not describe its actual wire data.
+
+### Local tokens and USB/Wi-Fi recovery
+
+```toml
+[device]
+host = "10.0.4.20"
+fallback_hosts = ["192.0.2.20"] # replace with your bar's Wi-Fi address
+local_token = ""              # preferably supply BUSYBAR_LOCAL_TOKEN instead
+transport = "auto"
+discover = false
+# device_id = "001122aabbcc"  # USB MAC with colons removed, for opt-in discovery
+```
+
+Local tokens use `X-API-Token`; cloud tokens use `Authorization: Bearer`.
+Redirects are disabled and credentials are kept separate. Token creation or
+revocation is not automatic. Supply only addresses for the same trusted device;
+mDNS and local HTTP are not a cryptographic device identity check.
+
+Explicit local alternatives work without extra dependencies. Optional discovery
+uses the firmware's actual HTTP service registration, not a proprietary service:
+`busybar-<USB MAC>._http._tcp.local.` on port 80.
+
+```bash
+uv sync --extra discovery
+uv run python -m busybar discover --timeout 3
+```
+
+Use the returned bare `device_id` with `discover = true`. Discovery scans are
+short, close their resources, and refresh no more than once per minute. The
+client tries at most four local addresses per operation, then the configured
+cloud route for supported operations. A working fallback remains preferred
+between recovery probes. Missing discovery support or a failed scan leaves
+explicit hosts usable; the CLI distinguishes an unavailable scan from a
+successful scan that found no devices.
+
+HTTP rejections (including authentication errors and a higher-priority canvas)
+do not trigger failover. Reads and display updates can use bounded fallback.
+Audio and timer starts are not replayed after an uncertain send/read failure;
+only a definite connection timeout permits another route. Calendar chirps are
+attempted once per event edge, and `auto_busy` requires a positively observed
+nested `NOT_STARTED` snapshot rather than treating unavailable state as idle.
+
+### Platform examples
+
+- [Home Assistant](examples/home_assistant/README.md): built-in REST sensors
+  for the nested BUSY snapshot and an expiring notification command with a
+  secret placeholder. Notices stay below urgent calendar and BUSY-session
+  priority and expire within 1–60 seconds. This is optional YAML, not a custom
+  integration or an automatic HA installation.
+- [On-device JavaScript](examples/javascript/README.md): a finite 30-second
+  health demo using fetch, timers, and one persisted run counter. Scripts can
+  be uploaded into app asset subdirectories with `upload_asset(app,
+  "scripts/main.js", data)`. The firmware runner is experimental; this example
+  does not replace the host integrations or install persistent autostart.
+
+Protocol references: [firmware 1.2.3 release](https://github.com/busy-app/busybar-firmware/releases/tag/1.2.3),
+[display API](https://github.com/busy-app/busybar-firmware/blob/2cd7ec8abf8479ba3398241e99d291ec24f2a96f/applications/services/web_server/openapi/assets.yaml),
+[HTTP service registration](https://github.com/busy-app/busybar-firmware/blob/2cd7ec8abf8479ba3398241e99d291ec24f2a96f/applications/services/web_server/web_server.c).
 
 ## How it works
 
@@ -127,10 +226,13 @@ revoke the old one, rather than revoking first.
 
 Continuous status streaming (`/api/status/ws`) is local-only by design —
 the cloud API has no equivalent, so a caller relying on the status
-WebSocket will not get a cloud fallback for it. Everything else this
-client uses (`draw`, `clear`, `status`, `get_busy`, `set_busy_simple`,
-`play_audio`) is a synchronous request/response call and mirrors 1:1
-over cloud.
+WebSocket will not get a cloud fallback for it. Selective deletion, asset
+uploads, capability probes, and the diagnostic screen are also local-only.
+Ordinary `draw`, `clear`, `status`, and `get_busy` calls retain cloud support;
+new bitmap/layer fields are omitted from cloud drawings. Bitmap-only frames
+require verified modern local firmware and never fall back to an empty cloud
+draw. `set_busy_simple` and `play_audio` can use cloud directly, but an uncertain
+local send is not replayed through the relay.
 
 ### Verified against the live cloud API
 

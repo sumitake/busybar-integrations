@@ -8,6 +8,9 @@ dependencies = [
     "pyobjc-framework-EventKit>=10.3; sys_platform == 'darwin'",
 ]
 
+[project.optional-dependencies]
+discovery = ["zeroconf>=0.147"]
+
 [dependency-groups]
 dev = ["pytest>=8.3", "pillow>=10.0"]
 

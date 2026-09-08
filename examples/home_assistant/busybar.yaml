@@ -1,0 +1,93 @@
+# Ordinary Home Assistant REST YAML; this is not a custom integration.
+# Store the local device token in secrets.yaml as busybar_api_token.
+
+rest:
+  - resource: "http://BUSY_BAR_IP/api/busy/snapshot"
+    method: GET
+    headers:
+      X-API-Token: !secret busybar_api_token
+      Accept: application/json
+    timeout: 5
+    scan_interval: 10
+    sensor:
+      - name: BUSY Bar Timer
+        unique_id: busybar_timer
+        # Firmware 1.2.3 returns {snapshot: {...}, snapshot_timestamp_ms}.
+        # Keep an unknown type unknown; it must not look like an idle timer.
+        value_template: >-
+          {% if value_json is mapping %}
+            {% set snapshot = value_json.get('snapshot', {}) %}
+            {{ snapshot.get('type', 'unknown') if snapshot is mapping else 'unknown' }}
+          {% else %}
+            unknown
+          {% endif %}
+        availability: >-
+          {{ value_json is mapping and value_json.get('snapshot') is mapping
+             and value_json['snapshot'].get('type') is not none }}
+        json_attributes_path: "$.snapshot"
+        json_attributes:
+          - type
+          - card_id
+          - time_left_ms
+          - is_paused
+          - busy_bar_settings
+
+      - name: BUSY Bar Time Left
+        unique_id: busybar_time_left_ms
+        unit_of_measurement: ms
+        value_template: >-
+          {% if value_json is mapping %}
+            {% set snapshot = value_json.get('snapshot', {}) %}
+            {% if snapshot is mapping and snapshot.get('time_left_ms') is number %}
+              {{ snapshot['time_left_ms'] }}
+            {% else %}
+              unknown
+            {% endif %}
+          {% else %}
+            unknown
+          {% endif %}
+        availability: >-
+          {{ value_json is mapping and value_json.get('snapshot') is mapping
+             and value_json['snapshot'].get('time_left_ms') is number }}
+
+rest_command:
+  busybar_draw_expiring_notice:
+    url: "http://BUSY_BAR_IP/api/display/draw"
+    method: POST
+    headers:
+      X-API-Token: !secret busybar_api_token
+      Accept: application/json
+    content_type: application/json
+    timeout: 5
+    # Priority 21 is the calm overlay tier: below calendar urgent (65) and a
+    # firmware BUSY/session (90), while still above the calendar ambient tier.
+    payload: >-
+      {% set ttl = timeout_seconds | default(20) | int %}
+      {% if ttl < 1 %}{% set ttl = 1 %}{% elif ttl > 60 %}{% set ttl = 60 %}{% endif %}
+      {
+        "application_name": "ha_busybar",
+        "priority": 21,
+        "elements": [{
+          "id": "ha-expiring-notice",
+          "type": "text",
+          "x": 36,
+          "y": 8,
+          "align": "center",
+          "font": "small",
+          "text": {{ message | default('HA notice') | tojson }},
+          "timeout": {{ ttl }}
+        }]
+      }
+
+# Optional cue for an existing HA state change. It draws a notice only; it
+# does not start, stop, or alter a BUSY timer.
+# automation:
+#   - alias: BUSY Bar cue when timer changes
+#     trigger:
+#       - platform: state
+#         entity_id: sensor.busybar_timer
+#     action:
+#       - service: rest_command.busybar_draw_expiring_notice
+#         data:
+#           message: "BUSY: {{ states('sensor.busybar_timer') }}"
+#           timeout_seconds: 20

@@ -24,6 +24,14 @@ cloud_base_url = "https://api.busy.app/busybar"
 transport = "auto"          # "auto" (local, fall back to cloud) | "local" | "cloud" (forced --
                               # mainly for deliberately testing the cloud path)
 
+# Local API-token and route discovery are opt-in. The local token is sent only
+# to the device as X-API-Token; it is never sent to BUSY's cloud relay. Prefer
+# BUSYBAR_LOCAL_TOKEN in your environment over writing a token in config.toml.
+local_token = ""
+fallback_hosts = []          # at most three explicit LAN fallback hosts
+discover = false             # mDNS convenience on a trusted LAN; not authentication
+device_id = ""               # exact 12-hex USB MAC without colons when discover = true
+
 [calendar_countdown]
 poll_seconds = 10            # ambient-tier redraw cadence (default: 10) -- matches the running-CI
                               # overlay's 10s dwell gap so this app's redraws reliably land inside
@@ -63,6 +71,7 @@ running_poll_seconds = 20    # poll interval while a run is active (shortened fr
 show_quota = true            # GraphQL/REST quota frames join the overlay rotation while a run
                               # is active (no effect if show_running is false)
 running_spinner = true       # animated 8x8 spinner on the running badge
+bitmap_icons = true          # use small XPM2 accents on current local firmware; text layout remains the fallback
 
 # Account-wide watching (v1.5.1) -- off by default. When on, the watch list
 # becomes auto-discovered account repos UNION `repos` above, MINUS

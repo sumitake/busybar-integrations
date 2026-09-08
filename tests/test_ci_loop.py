@@ -713,3 +713,25 @@ def test_overlay_dwell_rejected_during_calendar_elevation_resumes_after():
     assert overlay_state.get("last_dwell_end") is not None
     assert overlay_state["last_shape"] == frozenset({"bg", "title", "track", "track_fill", "eta"})
     assert client.draw.call_count == 2   # both attempts drew (1st rejected, 2nd landed) -- no crash anywhere
+
+
+def test_modern_ci_preserves_text_and_icon_when_failure_background_is_removed():
+    client = Mock()
+    client.supports_display_v2 = True
+    client.remove_elements.return_value = True
+    client.draw.return_value = DrawResult.DRAWN
+    poller = Mock()
+    poller.fetch_runs.return_value = [_run("failure")]
+    state = {}
+    cfg = {"ci_status": {**CFG["ci_status"], "show_green": True}}
+    run_once(client, poller, cfg, NOW, {}, False, overlay_state=state)
+    first = client.draw.call_args.args[1]
+    assert any(e["type"] == "xpmbitmap" for e in first)
+    assert state["last_priority"] == PRIORITY_OVERLAY
+    poller.fetch_runs.return_value = [_run("success")]
+    run_once(client, poller, cfg, NOW + timedelta(seconds=21), {}, False, overlay_state=state)
+    client.remove_elements.assert_called_once_with("ci_status", ["bg"])
+    client.clear.assert_not_called()
+    frame = client.draw.call_args.args[1]
+    assert {e["id"] for e in frame} == {"ci", "ci_status_icon"}
+    assert all(e["timeout"] == 10 for e in frame)

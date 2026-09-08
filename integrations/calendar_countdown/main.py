@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import device_kwargs, load_config
 from busybar.display import PRIORITY_AMBIENT, ambient_timeout
+from busybar.presentation import modern_display, prepare_frame, commit_frame
 
 from .logic import (ascii_safe, build_elements, select_active_event,
                     select_next_event, _minutes_left, select_priority,
@@ -28,47 +29,13 @@ log = logging.getLogger(APP)
 
 def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
             state: dict | None = None) -> str:
-    """Run one poll cycle. `state`, when passed, is a caller-owned dict this
-    function uses to remember the last drawn element-id set (`last_shape`,
-    v1.6 -- see below) across calls (main() passes one shared dict across
-    loop iterations; tests calling run_once standalone can omit it), plus
-    (v1.5.2) the next known event's start time (`next_start`, for the T-0
-    sleep-shortening in main()'s loop), the chirp edge-detection
-    bookkeeping (`seen_upcoming`/`chirped`, maintained by
-    should_chirp/commit_chirped), and `led_on` -- whether the LED is
-    believed to currently be lit, committed only after a confirmed
-    successful send (see resolve_led_value's docstring). This last one
-    matters on EVERY path that can draw or otherwise signal the device,
-    including the "no upcoming event" path below: an event that vanishes
-    without ever passing through `in_progress=True` (filtered out, or
-    shorter than one poll interval) must still resolve its LED to an
-    explicit off, not silently strand it lit. See calendar_countdown.logic
-    for the full escalation-ladder, LED, chirp, and start-takeover design.
+    """Render one complete expiring frame and remember confirmed display state.
 
-    The upcoming, in-progress, and (v1.6) start-takeover layouts each use a
-    different element id set (`time` vs `ends` vs the takeover's `bg`+
-    `cal_start_anim` alone -- and the upcoming layout's own id set already
-    varies further with the escalation-icon sub-states, see
-    build_elements) and the device's draw endpoint upserts by id rather
-    than replacing an app's whole element set -- confirmed on-device that
-    switching id sets without an explicit clear leaves the previous set's
-    elements rendered on top of the new ones until their own timeout
-    expires (originally found with the v1.3 `time_card`+`time` vs `ends`
-    id sets; the same upsert-by-id model applies regardless of which ids
-    are in play). `state["last_shape"]` (v1.6 -- replaces the earlier
-    boolean `state["in_progress"]` transition check, which only caught the
-    upcoming<->in-progress edge and missed every other id-set change the
-    escalation icons and start-takeover introduce) is a frozenset of the
-    ids in the most recently DRAWN payload; comparing it against the ids
-    about to be drawn THIS poll lets run_once clear only when the id set
-    actually changed, not on every poll -- mirrors ci_status's own unified
-    shape tracker (see ci_status.main.run_once's docstring). Priority
-    changes (v1.5.2's escalation ladder) do NOT need this same
-    clear-on-change treatment: they're the same app_name upserting the
-    same element ids at a new priority number, not a shape change -- see
-    busybar.display's PRIORITY_AMBIENT_URGENT docstring for why a
-    strictly-higher same-app_name draw always succeeds regardless of
-    priority.
+    Firmware 1.2.3 can remove obsolete IDs while preserving common content at
+    the same priority. Older firmware, type changes, and priority reductions
+    use an app-scoped clear. Full scheduled redraws still renew timeouts and
+    reclaim a canvas evicted by another app. Audio is attempted once per event
+    edge, because a missing response does not prove it failed to play.
     """
     c = cfg["calendar_countdown"]
     timeout_s = ambient_timeout(c["poll_seconds"])
@@ -77,8 +44,9 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
 
     if c["auto_busy"] and not dry_run and active is not None:
         remaining_ms = int((active.end - now).total_seconds() * 1000)
-        busy = client.get_busy() or {}
-        if busy.get("type") in (None, "NOT_STARTED"):
+        busy = client.get_busy()
+        snapshot = busy.get("snapshot", {}) if isinstance(busy, dict) else {}
+        if isinstance(snapshot, dict) and snapshot.get("type") == "NOT_STARTED":
             client.set_busy_simple(remaining_ms)
 
     # An in-progress event takes display priority over a later upcoming one.
@@ -123,33 +91,15 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     if dry_run:
         return f"DRY-RUN would draw: {label} (in_progress={in_progress})"
 
-    # Event-start chirp (v1.5.2): fires on the upcoming -> in_progress
-    # transition edge only -- see should_chirp's docstring for the full
-    # restart-safety and once-per-event reasoning. Placed after the
-    # dry_run return so a dry run never plays real audio or touches the
-    # chirp bookkeeping.
-    #
-    # Observability (v1.5.2.1): log EVERY attempt at INFO, success or
-    # failure -- not just failures (client.play_audio already logs those
-    # at WARNING). This is what the silent-.wav bug needed and didn't
-    # have: a 200/True response from play_audio does NOT prove audible
-    # playback (see play_audio's docstring for the full deferred-open/
-    # swallowed-failure explanation), so a log line is the only trace
-    # this process can leave for later correlation against an operator's
-    # own ear-test -- a "successful" chirp that nobody heard was
-    # previously doubly silent (no sound AND no log line), which is why
-    # the root cause took device storage forensics to find instead of a
-    # five-second log check.
     if state is not None:
         if should_chirp(event, in_progress, now, state, c["chirp"]):
+            # Record the attempt before sending. A timeout can follow playback;
+            # repeating it on the next calendar poll would duplicate the sound.
+            commit_chirped(event, state)
             played = client.play_audio(APP, stock_path=CHIRP_STOCK_PATH)
             log.info("chirp played (%s) -> %s", CHIRP_STOCK_PATH, played)
-            if played:
-                commit_chirped(event, state)
-            # else: leaving "chirped" uncommitted means the next poll
-            # (still in_progress, same event) retries rather than
-            # silently skipping the chirp forever.
 
+    modern = modern_display(client)
     # v1.6 start-takeover: True for the first start_window_seconds after an
     # event begins (see is_just_started's docstring) -- holds the display
     # at PRIORITY_AMBIENT_URGENT and swaps in the full-panel takeover
@@ -164,80 +114,25 @@ def run_once(client, fetch, cfg: dict, now: datetime, dry_run: bool,
     led_was_on = state.get("led_on", False) if state is not None else False
     led = resolve_led_value(led_should_be_on, led_was_on)
 
-    # Unified shape-tracker clear (v1.6, replaces the old boolean
-    # state["in_progress"]-transition check -- see this function's
-    # docstring for why that check alone can no longer catch every id-set
-    # change once escalation icons and the start-takeover are in play).
-    # `new_shape` must be computed from THIS poll's elements before the
-    # draw call below.
-    new_shape = frozenset(e["id"] for e in elements)
-    if state is not None:
-        last_shape = state.get("last_shape")
-        if last_shape is not None and last_shape != new_shape:
-            # clear()'s own success/failure is intentionally not checked here --
-            # only draw()'s result (below) gates whether `state` commits. If
-            # clear() silently fails but draw() then succeeds, the new element
-            # set is still correctly installed via the id-upsert; any leftover
-            # stale ids from before the failed clear are bounded by their own
-            # original timeout, a one-off gap that self-heals, not a reason to
-            # re-clear on every subsequent poll. Gating on clear() too would mean
-            # a persistently-failing clear() retries forever even once draw()
-            # keeps succeeding, since `state` would never converge.
-            client.clear(APP)
+    elements = prepare_frame(client, APP, elements, priority, state, modern=modern)
 
     result = client.draw(APP, elements=elements, priority=priority, led_notification_color=led)
 
-    # v1.6.1 start-takeover graceful degradation: the just_started takeover
-    # is a FULL-PANEL swap -- its only two elements are `bg` + the stock
-    # animation named by start_animation (see build_elements). If that name
-    # doesn't match a stock animation on the device (an operator typo; the
-    # default meeting_72x16 is valid), the live device rejects the draw with
-    # DrawResult.ERROR every poll, `state` never commits, and run_once
-    # re-clears + re-fails each poll -- leaving the panel DARK for the whole
-    # start_window_seconds (~60s) instead of showing anything. Nothing else
-    # is on screen to mask it, because the takeover IS the whole screen.
-    #
-    # Fall back to the normal in-progress ("ENDS") layout for THIS poll so a
-    # mistyped start_animation degrades to a live countdown rather than a
-    # blank panel. Only ERROR triggers this, deliberately:
-    #   - REJECTED means a strictly-higher-priority app already owns the
-    #     screen; the in-progress layout draws at a LOWER priority
-    #     (PRIORITY_AMBIENT vs the takeover's PRIORITY_AMBIENT_URGENT) and
-    #     would be rejected too -- a pointless second draw.
-    #   - UNREACHABLE means the device is down; the loop's backoff (main())
-    #     handles that, and a retry would just be unreachable again.
-    # Per-poll, not latched: if the operator fixes the config value or the
-    # stock animation later appears, the very next poll's takeover draw
-    # succeeds with no restart -- the same retry-not-assume discipline the
-    # led_on/chirp commits follow (commit only on confirmed success). No
-    # extra clear() is needed before the fallback draw: the failed takeover
-    # draw landed nothing, and the shape-tracker clear above already fired
-    # for any real id-set change (last_shape is never the takeover shape,
-    # since a takeover ERROR never commits it), so the device is already
-    # blank whenever it mattered -- see this function's docstring on the
-    # upsert-by-id model and why only draw() gates the state commit.
+    # A missing stock animation may reject the takeover. Fall back to the
+    # ordinary countdown on ERROR; a busy owner or unreachable device does not
+    # benefit from another lower-priority request.
     if just_started and result == DrawResult.ERROR:
         log.warning("start-takeover animation %r not drawable; falling back to "
                     "in-progress layout for this poll", c["start_animation"])
         elements = build_elements(event, now, c, timeout_s, in_progress, just_started=False)
         priority = select_priority(minutes_left, c["approach_minutes"], c["notice_minutes"],
                                    in_progress, just_started=False)
-        new_shape = frozenset(e["id"] for e in elements)
+        elements = prepare_frame(client, APP, elements, priority, state, modern=modern)
         result = client.draw(APP, elements=elements, priority=priority, led_notification_color=led)
         label = f"{label} [start-anim fallback]"
 
+    commit_frame(state, elements, priority, result)
     if state is not None and result == DrawResult.DRAWN:
-        # Only commit the transition once it actually lands on the device.
-        # If draw() failed (UNREACHABLE/REJECTED/ERROR), leave `state`
-        # unchanged so the next poll still sees the same mismatch and
-        # retries the clear+draw pair, rather than assuming a transition
-        # happened that never actually reached the device -- which would
-        # otherwise let stale elements from the old layout persist
-        # unbounded (no further poll would ever re-attempt the clear).
-        state["last_shape"] = new_shape
-        # Same discipline for the LED: only believe it's in the intended
-        # state once this exact draw (carrying that exact led value) is
-        # confirmed to have landed.
         state["led_on"] = led_should_be_on
     return f"drew {label} -> {result.value}"
 
@@ -292,7 +187,8 @@ def main() -> int:
     # clear plus the transition-state clear above are sufficient, since a
     # deploy always restarts the process (fresh client.clear(APP) here) and
     # build_elements() simply never emits those ids again afterward.
-    client.clear(APP)
+    if not args.dry_run:
+        client.clear(APP)
     fetch = lambda hours: eventkit.fetch_events(hours, cfg["calendar_countdown"]["calendars"])
 
     backoff = 5

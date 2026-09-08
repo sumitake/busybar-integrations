@@ -430,9 +430,9 @@ def test_run_once_restart_mid_event_does_not_chirp():
     run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
     client.play_audio.assert_not_called()
 
-def test_run_once_chirp_retries_next_poll_if_play_fails():
+def test_run_once_chirp_does_not_replay_after_unconfirmed_play():
     client = Mock(); client.draw.return_value = DrawResult.DRAWN
-    client.play_audio.return_value = False   # transient failure
+    client.play_audio.return_value = False   # response may be lost after playback
     state: dict = {}
     upcoming = make_event(0.2)
     run_once(client, lambda hours: [upcoming], CFG, NOW, dry_run=False, state=state)
@@ -441,10 +441,10 @@ def test_run_once_chirp_retries_next_poll_if_play_fails():
     run_once(client, lambda hours: [started], CFG, later, dry_run=False, state=state)
     assert client.play_audio.call_count == 1
 
-    # Retries on the next poll since the failure wasn't committed.
+    # A missing response is not evidence that the sound did not play.
     client.play_audio.return_value = True
     run_once(client, lambda hours: [started], CFG, later + timedelta(seconds=5), dry_run=False, state=state)
-    assert client.play_audio.call_count == 2
+    assert client.play_audio.call_count == 1
 
 def test_run_once_dry_run_never_chirps():
     client = Mock()
@@ -626,3 +626,33 @@ def test_start_takeover_fallback_is_per_poll_not_latched():
     assert len(c.draws) == 1                         # takeover, drawn straight away
     assert any(e["id"] == START_ANIM_ID for e in c.draws[0][0])
     assert st["last_shape"] == frozenset({"bg", START_ANIM_ID})
+
+
+def test_modern_calendar_layers_and_same_shape_priority_stepdown():
+    client = Mock()
+    client.supports_display_v2 = True
+    client.draw.return_value = DrawResult.DRAWN
+    state = {}
+    run_once(client, lambda _: [make_event(3)], CFG, NOW, False, state)
+    assert state["last_priority"] == 65
+    # A rescheduled event has the same IDs but a lower priority. Without a
+    # scoped clear, the firmware rejects this same-app priority reduction.
+    run_once(client, lambda _: [make_event(40)], CFG, NOW, False, state)
+    client.clear.assert_called_once_with("calendar_countdown")
+    assert state["last_priority"] == 20
+    elements = client.draw.call_args.kwargs["elements"]
+    assert [e["z_index"] for e in elements] == list(range(0, len(elements) * 10, 10))
+
+
+def test_auto_busy_requires_confirmed_nested_idle_snapshot():
+    cfg = {"calendar_countdown": {**CFG["calendar_countdown"], "auto_busy": True}}
+    client = Mock()
+    client.draw.return_value = DrawResult.DRAWN
+    event = make_event(-5)
+    for response in (None, {}, {"snapshot": None}, {"snapshot": {"type": "SIMPLE"}}):
+        client.get_busy.return_value = response
+        run_once(client, lambda _: [event], cfg, NOW, False)
+    client.set_busy_simple.assert_not_called()
+    client.get_busy.return_value = {"snapshot": {"type": "NOT_STARTED"}, "timestamp": 1}
+    run_once(client, lambda _: [event], cfg, NOW, False)
+    client.set_busy_simple.assert_called_once_with(25 * 60 * 1000)

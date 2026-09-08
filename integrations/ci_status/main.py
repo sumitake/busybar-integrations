@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from busybar.client import BusyBarClient, DrawResult
 from busybar.config import device_kwargs, load_config
 from busybar.display import OVERLAY_DWELL_SECONDS, PRIORITY_OVERLAY, overlay_gap_elapsed
+from busybar.presentation import modern_display, prepare_frame, commit_frame, ci_bitmap_accent
 
 from .logic import (
     RepoState, RunningInfo, QuotaInfo,
@@ -125,29 +126,12 @@ def run_once(client, poller, cfg: dict, now: datetime,
     failed draw must not be mistaken for a completed dwell, or the
     rotation would silently skip frames / wait a dwell for nothing.
 
-    `overlay_state["last_shape"]` is a *unified* shape tracker, not
-    overlay-specific despite living in this dict: it records the element-id
-    set of whatever payload was last actually drawn to `APP`, across every
-    tier that can draw here -- an alert badge, the quiet-green text, or
-    either overlay frame kind -- and every draw path below checks it before
-    drawing and commits to it after DRAWN. The firmware upserts by element
-    id within an `application_name`, and each of these payload shapes has a
-    different id set (`{bg, ci}` for an alert, `{ci}` alone for quiet
-    green, `{bg, title, track, track_fill, eta}` for the running badge,
-    `{bg, title, track, track_fill, pct, reset}` for a quota frame) --
-    switching shapes without a clear() first leaves the previous shape's
-    now-orphaned ids rendered until their own timeout elapses (up to 1.5x
-    `poll_seconds` for an alert/green draw), the same upsert-by-id bug
-    class the v1.3.1 calendar transition-clear fix addressed, recurring at
-    every seam a different payload shape can follow another -- not just
-    between the two overlay-frame shapes. Critically, resetting the
-    rotation bookkeeping (`frame_index`/`last_dwell_end`, e.g. when an
-    alert preempts the overlay or a run ends) must NOT also reset
-    `last_shape`: that field describes what is physically on the device
-    right now, which a bookkeeping reset does not change, and clearing it
-    prematurely was the root cause of a real bug where the clear-gate saw
-    "no shape on record" and wrongly concluded no clear was needed on the
-    next transition.
+    The shared presentation helper remembers the last accepted shape, types
+    and priority. Modern local firmware removes obsolete IDs at same-priority
+    transitions; legacy or incompatible transitions clear this app's canvas.
+    Rotation bookkeeping resets must retain that display state until the
+    next successful draw or clear. Complete payloads still renew all TTLs and
+    recover evicted content. CI bitmap icons are optional cosmetic additions.
 
     Failure/stuck/green rotation (v1.6, Request B): the overlay tier's
     rotation is no longer gated on a run being active -- `build_overlay_sequence`
@@ -243,7 +227,7 @@ def run_once(client, poller, cfg: dict, now: datetime,
                                  led_notification_color=LED_OFF_COLOR)
             if result == DrawResult.DRAWN and overlay_state is not None:
                 overlay_state["led_was_on"] = False
-                overlay_state["last_shape"] = frozenset(e["id"] for e in LED_OFF_ELEMENTS)
+                commit_frame(overlay_state, LED_OFF_ELEMENTS, PRIORITY_OVERLAY, result)
             return f"led off; {result.value}"
         client.clear(APP)
         if overlay_state is not None:
@@ -265,19 +249,18 @@ def run_once(client, poller, cfg: dict, now: datetime,
     if dry_run:
         return f"DRY-RUN payload: {payload!r} led={led_value}"
 
-    # Unified shape-clear gate (see the original docstring): the firmware upserts
-    # by element id within an application_name, so a shape change needs a clear
-    # first. Spans every frame kind that can draw here.
-    shape = frozenset(e["id"] for e in payload["elements"])
-    if overlay_state is not None:
-        last_shape = overlay_state.get("last_shape")
-        if last_shape is not None and last_shape != shape:
-            client.clear(APP)
+    modern = modern_display(client)
+    elements = payload["elements"]
+    if modern and c.get("bitmap_icons", True):
+        elements = ci_bitmap_accent(elements, sequence[frame_index]["kind"],
+                                    OVERLAY_DWELL_SECONDS)
+    payload["elements"] = prepare_frame(client, APP, elements, payload["priority"],
+                                         overlay_state, modern=modern)
 
     result = client.draw(APP, payload["elements"], priority=payload["priority"],
                          led_notification_color=led_value)
     if result == DrawResult.DRAWN and overlay_state is not None:
-        overlay_state["last_shape"] = shape
+        commit_frame(overlay_state, payload["elements"], payload["priority"], result)
         overlay_state["led_was_on"] = led_should_be_on
         overlay_state["frame_index"] = frame_index + 1
         overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
@@ -336,7 +319,8 @@ def main() -> int:
         log.error(str(exc))
         return 1
     client = BusyBarClient(**device_kwargs(cfg))
-    client.clear(APP)  # drop any stale elements from a previous process (type collisions 400)
+    if not args.dry_run:
+        client.clear(APP)  # drop stale elements from a previous process
 
     state_cache: dict[str, RepoState] = {}
     running_cache: dict[str, list[dict]] = {}
