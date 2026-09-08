@@ -1,4 +1,5 @@
 import logging
+import pytest
 from unittest.mock import Mock, patch
 import requests
 from busybar.client import BusyBarClient, DrawResult
@@ -321,7 +322,10 @@ def test_upload_asset_success(mock_request):
     assert BusyBarClient().upload_asset("nyan_filler", "nyan_72x16.anim", data) is True
     method, url = mock_request.call_args.args
     assert method == "POST"
-    assert "application_name=nyan_filler" in url and "file=nyan_72x16.anim" in url
+    assert url == "http://10.0.4.20/api/assets/upload"
+    assert mock_request.call_args.kwargs["params"] == {
+        "application_name": "nyan_filler", "file": "nyan_72x16.anim"
+    }
     assert mock_request.call_args.kwargs["headers"] == {"Content-Type": "application/octet-stream"}
     assert mock_request.call_args.kwargs["data"] == data
 
@@ -407,3 +411,193 @@ def test_invalid_transport_value_raises_value_error():
         raise AssertionError("expected ValueError")
     except ValueError as exc:
         assert "carrier-pigeon" in str(exc)
+
+
+# --- firmware 1.2.3 local transport boundaries --------------------------------
+
+@patch("busybar.client.requests.request")
+def test_local_token_never_reaches_cloud_and_redirects_are_disabled(mock_request):
+    mock_request.side_effect = [requests.ConnectionError(), _response(200)]
+    client = BusyBarClient(host="192.0.2.1", local_token="local-only-token",
+                            cloud_token=FAKE_TOKEN, cloud_base_url="https://cloud.example.test/busybar")
+    assert client.draw("app", ELEMENTS) == DrawResult.DRAWN
+    local_call, cloud_call = mock_request.call_args_list
+    assert local_call.kwargs["headers"] == {"X-API-Token": "local-only-token"}
+    assert cloud_call.kwargs["headers"] == {"Authorization": f"Bearer {FAKE_TOKEN}"}
+    assert local_call.kwargs["allow_redirects"] is False
+    assert cloud_call.kwargs["allow_redirects"] is False
+
+
+@patch("busybar.client.requests.request")
+def test_unsafe_audio_is_not_replayed_after_read_or_connection_uncertainty(mock_request):
+    client = _cloud_client()
+    mock_request.side_effect = requests.ReadTimeout()
+    assert client.play_audio("app", stock_path="shared/x.snd") is False
+    assert mock_request.call_count == 1
+    mock_request.reset_mock()
+    mock_request.side_effect = requests.ConnectionError()
+    assert client.set_busy_simple(1_000) is False
+    assert mock_request.call_count == 1
+
+
+@patch("busybar.client.requests.request")
+def test_unsafe_audio_may_fail_over_after_definite_connect_timeout(mock_request):
+    mock_request.side_effect = [requests.ConnectTimeout(), _response(200)]
+    assert _cloud_client().play_audio("app", stock_path="shared/x.snd") is True
+    assert mock_request.call_count == 2
+    assert mock_request.call_args_list[1].args[1].startswith("https://cloud.example.test/")
+
+
+@patch("busybar.client.requests.request")
+def test_auth_and_conflict_responses_never_trigger_failover(mock_request):
+    for status in (401, 403, 409):
+        mock_request.reset_mock()
+        mock_request.return_value = _response(status)
+        assert _cloud_client().draw("app", ELEMENTS) in (DrawResult.ERROR, DrawResult.REJECTED)
+        assert mock_request.call_count == 1
+
+
+@patch("busybar.client.requests.request")
+def test_configured_fallback_host_is_tried_before_cloud(mock_request):
+    mock_request.side_effect = [requests.ConnectionError(), _response(200)]
+    client = _cloud_client(fallback_hosts=["192.0.2.2"])
+    assert client.status() == {}
+    assert [call.args[1] for call in mock_request.call_args_list] == [
+        "http://192.0.2.1/api/status", "http://192.0.2.2/api/status"
+    ]
+
+
+@patch("busybar.client.time.monotonic")
+@patch("busybar.client.requests.request")
+def test_capabilities_are_local_only_and_cached(mock_request, mock_time):
+    mock_time.return_value = 0.0
+    mock_request.return_value = _response(200, {"api_semver": "27.5.0"})
+    client = BusyBarClient()
+    assert client.refresh_capabilities() is True
+    assert client.supports_display_v2 is True
+    mock_time.return_value = 30.0
+    assert client.refresh_capabilities() is True
+    assert mock_request.call_count == 1
+    cloud = _cloud_client(transport="cloud")
+    assert cloud.refresh_capabilities() is False
+    assert cloud.supports_display_v2 is False
+
+
+@patch("busybar.client.requests.request")
+def test_read_only_diagnostics_support_documented_json_and_screen_paths(mock_request):
+    response = _response(200, {"version": "ok"})
+    response.content = b"screen-bytes"
+    mock_request.return_value = response
+    client = BusyBarClient(local_token="local-token")
+    assert client.get_json("/api/status/firmware", local_only=True) == {"version": "ok"}
+    assert client.get_bytes("/api/screen?display=0") == b"screen-bytes"
+    assert all(call.kwargs["headers"] == {"X-API-Token": "local-token"} for call in mock_request.call_args_list)
+
+
+@patch("busybar.client.requests.request")
+def test_remove_elements_uses_query_owner_and_never_duplicates_it_in_json(mock_request):
+    mock_request.return_value = _response(200)
+    client = BusyBarClient()
+    client.supports_display_v2 = True
+    assert client.remove_elements("app", ["obsolete", "other"])
+    assert mock_request.call_args.args == ("DELETE", "http://10.0.4.20/api/display/draw")
+    assert mock_request.call_args.kwargs["params"] == {"application_name": "app"}
+    assert mock_request.call_args.kwargs["json"] == {"element_ids": ["obsolete", "other"]}
+    mock_request.reset_mock()
+    assert BusyBarClient().remove_elements("app", []) is True
+    assert mock_request.call_count == 0
+
+
+@patch("busybar.client.requests.request")
+def test_remove_elements_requires_verified_current_local_capability(mock_request):
+    client = BusyBarClient()
+    assert client.remove_elements("app", ["obsolete"]) is False
+    assert mock_request.call_count == 0
+
+
+@patch("busybar.client.requests.request")
+def test_subdirectory_asset_upload_and_traversal_rejection(mock_request):
+    mock_request.return_value = _response(200)
+    client = BusyBarClient()
+    assert client.upload_asset("app", "icons/ok.xpm", b"x") is True
+    assert mock_request.call_args.kwargs["params"]["file"] == "icons/ok.xpm"
+    mock_request.reset_mock()
+    assert client.upload_asset("app", "../nope.xpm", b"x") is False
+    assert client.upload_asset("app", "/nope.xpm", b"x") is False
+    assert mock_request.call_count == 0
+
+
+@patch("busybar.client.requests.request")
+def test_bitmaps_and_z_index_degrade_for_legacy_and_cloud(mock_request):
+    mixed = [
+        {"id": "icon", "type": "xpmbitmap", "xpmbitmap": "xpm"},
+        {"id": "text", "type": "text", "text": "ok", "z_index": 99},
+    ]
+    mock_request.return_value = _response(200)
+    assert BusyBarClient().draw("app", mixed) == DrawResult.DRAWN
+    legacy = mock_request.call_args.kwargs["json"]["elements"]
+    assert legacy == [{"id": "text", "type": "text", "text": "ok"}]
+    mock_request.reset_mock()
+    mock_request.side_effect = [requests.ConnectionError(), _response(200)]
+    client = _cloud_client()
+    client.supports_display_v2 = True
+    assert client.draw("app", mixed) == DrawResult.DRAWN
+    local, cloud = mock_request.call_args_list
+    assert local.kwargs["json"]["elements"][0]["z_index"] == 0
+    assert cloud.kwargs["json"]["elements"] == [{"id": "text", "type": "text", "text": "ok"}]
+
+
+@patch("busybar.client.requests.request")
+def test_all_bitmap_payload_is_rejected_before_an_empty_legacy_or_cloud_draw(mock_request):
+    assert BusyBarClient().draw("app", [{"id": "icon", "type": "xpmbitmap", "xpmbitmap": "xpm"}]) == DrawResult.ERROR
+    assert mock_request.call_count == 0
+
+
+@patch("busybar.client.requests.request")
+def test_malformed_snapshot_json_is_unknown(mock_request):
+    response = _response(200)
+    response.json.side_effect = ValueError("bad json")
+    mock_request.return_value = response
+    assert BusyBarClient().get_busy() is None
+
+
+@patch("busybar.client.requests.request")
+def test_bitmap_only_is_supported_locally_without_empty_cloud_fallback(mock_request):
+    client = _cloud_client()
+    client.supports_display_v2 = True
+    bitmap = [{"id": "icon", "type": "xpmbitmap", "data": "! XPM2\n1 1 1 1\nX c #FFFFFF\nX\n", "timeout": 5}]
+    mock_request.return_value = _response(200)
+    assert client.draw("app", bitmap) == DrawResult.DRAWN
+    assert mock_request.call_args.kwargs["json"]["elements"][0]["type"] == "xpmbitmap"
+    mock_request.reset_mock()
+    mock_request.side_effect = requests.ReadTimeout()
+    assert client.draw("app", bitmap) == DrawResult.UNREACHABLE
+    assert mock_request.call_count == 1
+    assert mock_request.call_args.args[1].startswith("http://192.0.2.1/")
+
+
+def test_discovered_routes_cannot_expand_total_route_budget():
+    client = BusyBarClient(fallback_hosts=["192.0.2.1", "192.0.2.2", "192.0.2.3"])
+    client._discovered_hosts = ["192.0.2.4", "192.0.2.5"]
+    assert len(client._all_local_hosts()) == 4
+
+
+@patch("busybar.client.requests.request")
+def test_discovery_failure_preserves_explicit_host(mock_request):
+    from busybar.discovery import DiscoveryUnavailable
+    mock_request.return_value = _response(200, {"api_semver": "27.5.0"})
+    with patch("busybar.discovery.discover_devices", side_effect=DiscoveryUnavailable("scan unavailable")):
+        client = BusyBarClient(host="192.0.2.8", discover=True, device_id="aabbccddeeff")
+        assert client.get_json("/api/version") == {"api_semver": "27.5.0"}
+    assert mock_request.call_args.args[1] == "http://192.0.2.8/api/version"
+
+
+@patch("busybar.client.requests.request")
+def test_empty_owner_cannot_turn_cleanup_into_global_delete(mock_request):
+    client = BusyBarClient()
+    client.supports_display_v2 = True
+    with pytest.raises(ValueError):
+        client.clear("")
+    with pytest.raises(ValueError):
+        client.remove_elements("", ["old"])
+    mock_request.assert_not_called()

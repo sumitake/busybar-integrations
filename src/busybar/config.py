@@ -20,6 +20,10 @@ DEFAULTS: dict = {
         "cloud_token": "",
         "cloud_base_url": "https://api.busy.app/busybar",
         "transport": "auto",  # "auto" | "local" | "cloud" (forced)
+        "local_token": "",
+        "fallback_hosts": [],
+        "discover": False,
+        "device_id": "",
     },
     "calendar_countdown": {
         # 10s matches busybar.display.AMBIENT_REDRAW_SECONDS -- the ambient
@@ -75,6 +79,7 @@ DEFAULTS: dict = {
         "active_within_days": 30,  # only repos pushed within this window are polled
         "repo_refresh_minutes": 60,  # how often the repo list itself is re-enumerated
         "running_spinner": True,        # animated 8x8 spinner on the running badge
+        "bitmap_icons": True,           # v1.2.3 cosmetic XPM2 accents when locally supported
     },
     "nyan_filler": {
         "enabled": True,
@@ -140,4 +145,7 @@ def load_config(path: Path | None = None) -> dict:
     env_host = os.environ.get("BUSYBAR_HOST")
     if env_host:
         cfg = _merge(cfg, {"device": {"host": env_host}})
+    env_local_token = os.environ.get("BUSYBAR_LOCAL_TOKEN")
+    if env_local_token:
+        cfg = _merge(cfg, {"device": {"local_token": env_local_token}})
     return cfg

@@ -1,283 +1,369 @@
+"""Bounded HTTP client for a BUSY Bar device.
+
+The local route is preferred. Cloud relay support remains optional, and local
+credentials are deliberately never sent to that relay. Discovery is a
+trusted-LAN convenience only; the configured service identifier prevents us
+from selecting an arbitrary discovered bar, but does not authenticate a LAN
+advertisement.
+"""
+
+from __future__ import annotations
+
 import logging
 import time
 from enum import Enum
+from pathlib import PurePosixPath
+from typing import Any
 
 import requests
 
 log = logging.getLogger(__name__)
 
 NULL_CARD_ID = "00000000-0000-0000-0000-000000000000"
-
-# v1.6 cloud transport fallback -- while degraded to cloud, `_request` skips
-# the (known-failing) local attempt and goes straight to cloud until this
-# many seconds have elapsed since the last local failure, then tries local
-# first again as a recovery probe. Doing this inline (no background thread)
-# is cheap because a down local device fails fast (connection refused/
-# timeout well under `timeout`), so the occasional probe costs little.
 LOCAL_RETRY_SECONDS = 60
+MAX_FALLBACK_HOSTS = 3
 
 
 class DrawResult(Enum):
     DRAWN = "drawn"
-    REJECTED = "rejected"        # 409: higher-priority app on screen — expected
-    UNREACHABLE = "unreachable"  # local AND cloud (if configured) both failed — caller backs off
-    ERROR = "error"              # non-200/409 from a live device — no backoff; retried next poll
+    REJECTED = "rejected"
+    UNREACHABLE = "unreachable"
+    ERROR = "error"
+
+
+def _version_at_least(value: object, minimum: tuple[int, int, int]) -> bool:
+    """Accept ordinary API version strings without adding a version package."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parts = tuple(int(part) for part in value.split(".")[:3])
+    except ValueError:
+        return False
+    return len(parts) == 3 and parts >= minimum
 
 
 class BusyBarClient:
-    """Talks to a single BUSY Bar device, over the LAN (local transport,
-    the default and preferred path) and, when configured, via BUSY's cloud
-    relay as an automatic fallback when the local device is unreachable.
+    """Synchronously talk to one configured BUSY Bar.
 
-    Transport selection (`transport`, mirroring busylib-py's single-class
-    transport-flag pattern rather than a class hierarchy -- see
-    scratchpad/busy-cloud-api-research.md for the source citations):
-
-    - `"auto"` (default): every call tries local first with `timeout`. On
-      a `requests.RequestException` AND a non-empty `cloud_token`, the
-      SAME request is retried against `cloud_base_url` with
-      `cloud_timeout` and an `Authorization: Bearer` header. `
-      active_transport` tracks which transport last succeeded. While
-      degraded (`active_transport == "cloud"`), subsequent calls skip the
-      local attempt and go straight to cloud until `LOCAL_RETRY_SECONDS`
-      have elapsed since the last local failure, at which point local is
-      retried first again as a recovery probe (see module docstring
-      constant above). `cloud_token = ""` (the shipped default) disables
-      cloud fallback entirely regardless of `transport="auto"` -- calls
-      behave exactly as they did before v1.6.
-    - `"local"`: local only, never falls back. Pre-v1.6 behavior exactly.
-    - `"cloud"`: cloud only, forced -- never attempts local. For
-      deliberately testing/debugging the cloud path.
-
-    Local endpoints are mounted at `/api/...`; the cloud API mirrors them
-    1:1 under `/busybar/...` relative to the cloud host. `cloud_base_url`'s
-    documented default (`https://api.busy.app/busybar`) already carries
-    that `/busybar` segment, so cloud requests are built by stripping the
-    local `/api` prefix and appending the remainder to `cloud_base_url`.
-
-    SECURITY: `cloud_token` is never logged or included in any log
-    statement, at any level including DEBUG -- only transport
-    *transitions* (local->cloud degradation, cloud->local recovery) are
-    logged, at INFO, and those log lines never include header values.
+    ``fallback_hosts`` is intentionally a small, explicit list. Optional mDNS
+    discovery runs only when ``discover`` and an exact ``device_id`` are
+    supplied. Both paths are finite and have no background listener or retry
+    worker.
     """
 
-    def __init__(self, host: str = "10.0.4.20", timeout: tuple = (3, 5), *,
-                cloud_token: str = "", cloud_base_url: str = "https://api.busy.app/busybar",
-                transport: str = "auto", cloud_timeout: tuple = (5, 15)):
+    def __init__(
+        self,
+        host: str = "10.0.4.20",
+        timeout: tuple = (3, 5),
+        *,
+        cloud_token: str = "",
+        cloud_base_url: str = "https://api.busy.app/busybar",
+        transport: str = "auto",
+        cloud_timeout: tuple = (5, 15),
+        local_token: str = "",
+        fallback_hosts: list[str] | tuple[str, ...] = (),
+        discover: bool = False,
+        device_id: str = "",
+    ):
         if transport not in ("auto", "local", "cloud"):
             raise ValueError(f"transport must be 'auto', 'local', or 'cloud', got {transport!r}")
-        self.base = f"http://{host}"
+        if len(fallback_hosts) > MAX_FALLBACK_HOSTS:
+            raise ValueError(f"fallback_hosts supports at most {MAX_FALLBACK_HOSTS} hosts")
+        if discover and not device_id:
+            raise ValueError("discover requires an exact device_id")
+
         self.timeout = timeout
         self.cloud_token = cloud_token
+        self.local_token = local_token
         self.cloud_base = cloud_base_url.rstrip("/")
         self.cloud_timeout = cloud_timeout
         self.transport = transport
-        # Cloud fallback is only "configured" with a non-empty token; an
-        # empty string (the shipped default) disables it in "auto" mode
-        # regardless of anything else. Forced transport="cloud" is exempt
-        # from this gate deliberately -- it's the caller's explicit,
-        # non-"auto" choice, not a fallback decision this client makes.
+        self.device_id = device_id.lower()
+        self.discover = discover
         self._cloud_configured = bool(cloud_token)
         self.active_transport = "cloud" if transport == "cloud" else "local"
-        self._degraded_since: float | None = None  # time.monotonic() of the last local
-                                                    # failure while in "auto" mode; None
-                                                    # whenever active_transport == "local"
+        self._degraded_since: float | None = None
+        self._last_primary_probe = 0.0
+        self._last_discovery: float | None = None
+        self._capabilities_checked_at: float | None = None
+        self.supports_display_v2 = False
+
+        routes: list[str] = []
+        for candidate in (host, *fallback_hosts):
+            if candidate and candidate not in routes:
+                routes.append(candidate)
+        self._static_hosts = routes
+        self._discovered_hosts: list[str] = []
+        self._local_index = 0
+        self.base = self._base_for(self._static_hosts[0])
+        if self.discover:
+            self._refresh_discovery()
+
+    @staticmethod
+    def _base_for(host: str) -> str:
+        return host if host.startswith(("http://", "https://")) else f"http://{host}"
+
+    def _all_local_hosts(self) -> list[str]:
+        return (self._static_hosts + [h for h in self._discovered_hosts if h not in self._static_hosts])[:4]
 
     def _mark_degraded(self) -> None:
         if self.active_transport != "cloud":
-            log.info("busybar transport: local -> cloud (local device unreachable; falling back)")
+            log.info("busybar transport: local -> cloud (local route unavailable)")
         self.active_transport = "cloud"
         self._degraded_since = time.monotonic()
 
     def _mark_recovered(self) -> None:
         if self.active_transport != "local":
-            log.info("busybar transport: cloud -> local (local device reachable again)")
+            log.info("busybar transport: cloud -> local (local route recovered)")
         self.active_transport = "local"
         self._degraded_since = None
 
     def _should_probe_local(self) -> bool:
-        return (self._degraded_since is not None
-                and (time.monotonic() - self._degraded_since) >= LOCAL_RETRY_SECONDS)
+        return self._degraded_since is not None and time.monotonic() - self._degraded_since >= LOCAL_RETRY_SECONDS
 
     def _cloud_path(self, path: str) -> str:
         return path[len("/api"):] if path.startswith("/api") else path
 
-    def _try_local(self, method: str, path: str, **kwargs) -> requests.Response | None:
+    def _refresh_discovery(self) -> None:
+        now = time.monotonic()
+        if not self.discover or (self._last_discovery is not None and now - self._last_discovery < LOCAL_RETRY_SECONDS):
+            return
+        self._last_discovery = now
         try:
-            return requests.request(method, f"{self.base}{path}", timeout=self.timeout, **kwargs)
+            from busybar.discovery import discover_devices
+
+            discovered: list[str] = []
+            for record in discover_devices(device_id=self.device_id):
+                for host in record.hosts:
+                    endpoint = f"{host}:{record.port}" if record.port != 80 else host
+                    if endpoint not in discovered:
+                        discovered.append(endpoint)
+                    if len(discovered) == 4:
+                        break
+                if len(discovered) == 4:
+                    break
+            self._discovered_hosts = discovered
+        except Exception:
+            # Optional discovery must never prevent configured routes.
+            log.warning("busybar discovery unavailable; using configured local routes")
+
+    def _local_order(self) -> list[str]:
+        hosts = self._all_local_hosts()
+        if not hosts:
+            return []
+        now = time.monotonic()
+        if self._local_index and now - self._last_primary_probe >= LOCAL_RETRY_SECONDS:
+            self._last_primary_probe = now
+            return [hosts[0], *[h for h in hosts if h != hosts[0]]]
+        preferred = min(self._local_index, len(hosts) - 1)
+        return [hosts[preferred], *[h for i, h in enumerate(hosts) if i != preferred]]
+
+    def _try_local(
+        self, method: str, path: str, *, replay_safe: bool, **kwargs: Any
+    ) -> tuple[requests.Response | None, BaseException | None]:
+        routes = self._local_order()
+        if not routes:
+            return None, None
+        headers = dict(kwargs.pop("headers", None) or {})
+        if self.local_token:
+            headers["X-API-Token"] = self.local_token
+        for route in routes:
+            try:
+                response = requests.request(
+                    method, f"{self._base_for(route)}{path}", timeout=self.timeout,
+                    headers=headers or None, allow_redirects=False, **kwargs,
+                )
+            except requests.ConnectTimeout as exc:
+                failure: BaseException = exc
+            except requests.RequestException as exc:
+                log.debug("local route unavailable (%s)", type(exc).__name__)
+                if not replay_safe:
+                    return None, exc
+                failure = exc
+            else:
+                self.base = self._base_for(route)
+                self._local_index = self._all_local_hosts().index(route)
+                return response, None
+            if not replay_safe and not isinstance(failure, requests.ConnectTimeout):
+                return None, failure
+        self._refresh_discovery()
+        return None, failure
+
+    def _try_cloud(self, method: str, path: str, **kwargs: Any) -> requests.Response | None:
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers["Authorization"] = f"Bearer {self.cloud_token}"
+        try:
+            return requests.request(
+                method, f"{self.cloud_base}{self._cloud_path(path)}", timeout=self.cloud_timeout,
+                headers=headers, allow_redirects=False, **kwargs,
+            )
         except requests.RequestException as exc:
-            log.debug("device unreachable: %s", exc)
+            log.debug("cloud route unavailable (%s)", type(exc).__name__)
             return None
 
-    def _try_cloud(self, method: str, path: str, **kwargs) -> requests.Response | None:
-        headers = {**(kwargs.pop("headers", None) or {}), "Authorization": f"Bearer {self.cloud_token}"}
-        try:
-            return requests.request(method, f"{self.cloud_base}{self._cloud_path(path)}",
-                                    timeout=self.cloud_timeout, headers=headers, **kwargs)
-        except requests.RequestException as exc:
-            log.debug("cloud unreachable: %s", exc)
-            return None
-
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response | None:
-        if self.transport == "local":
-            return self._try_local(method, path, **kwargs)
-
+    def _request(
+        self, method: str, path: str, *, replay_safe: bool = True,
+        local_only: bool = False, cloud_kwargs: dict[str, Any] | None = None, **kwargs: Any,
+    ) -> requests.Response | None:
         if self.transport == "cloud":
-            return self._try_cloud(method, path, **kwargs)
+            return None if local_only else self._try_cloud(method, path, **(cloud_kwargs or kwargs))
+        if self.transport == "local" or local_only:
+            return self._try_local(method, path, replay_safe=replay_safe, **kwargs)[0]
 
-        # transport == "auto": local-first-with-cloud-fallback, with the
-        # LOCAL_RETRY_SECONDS recovery probe described in the class
-        # docstring.
         if self.active_transport == "local" or self._should_probe_local():
-            resp = self._try_local(method, path, **kwargs)
-            if resp is not None:
+            response, failure = self._try_local(method, path, replay_safe=replay_safe, **kwargs)
+            if response is not None:
                 self._mark_recovered()
-                return resp
-            if not self._cloud_configured:
+                return response
+            if not self._cloud_configured or (not replay_safe and not isinstance(failure, requests.ConnectTimeout)):
                 return None
             self._mark_degraded()
+        return self._try_cloud(method, path, **(cloud_kwargs or kwargs))
 
-        return self._try_cloud(method, path, **kwargs)
+    def _display_payload(self, elements: list[dict], modern: bool) -> list[dict]:
+        payload: list[dict] = []
+        for index, raw in enumerate(elements):
+            item = dict(raw)
+            if not modern and item.get("type") == "xpmbitmap":
+                continue
+            if modern:
+                item.setdefault("z_index", index)
+            else:
+                item.pop("z_index", None)
+                item.pop("xpmbitmap", None)
+            payload.append(item)
+        return payload
 
     def draw(self, application_name: str, elements: list[dict], priority: int = 50,
              led_notification_color: str | None = None) -> DrawResult:
-        body: dict = {"application_name": application_name, "priority": priority,
-                      "elements": elements}
-        if led_notification_color is not None:
-            body["led_notification_color"] = led_notification_color
-        resp = self._request("POST", "/api/display/draw", json=body)
-        if resp is None:
+        local_modern = self.transport != "cloud" and self.active_transport == "local" and self.supports_display_v2
+        safe_elements = self._display_payload(elements, modern=False)
+        modern_elements = self._display_payload(elements, modern=True)
+        bitmap_only = bool(elements) and not safe_elements
+        if bitmap_only and not local_modern:
+            return DrawResult.ERROR
+
+        def body_for(items: list[dict]) -> dict[str, Any]:
+            body: dict[str, Any] = {"application_name": application_name, "priority": priority, "elements": items}
+            if led_notification_color is not None:
+                body["led_notification_color"] = led_notification_color
+            return body
+
+        response = self._request(
+            "POST", "/api/display/draw", json=body_for(modern_elements if local_modern else safe_elements),
+            cloud_kwargs={"json": body_for(safe_elements)}, local_only=bitmap_only,
+        )
+        if response is None:
             return DrawResult.UNREACHABLE
-        if resp.status_code == 409:
+        if response.status_code == 409:
             return DrawResult.REJECTED
-        if resp.status_code == 200:
+        if response.status_code == 200:
             return DrawResult.DRAWN
-        log.warning("draw failed: HTTP %s %s", resp.status_code, resp.text[:200])
+        log.warning("draw failed: HTTP %s", response.status_code)
         return DrawResult.ERROR
 
-    def play_audio(self, application_name: str, stock_path: str | None = None,
-                   path: str | None = None) -> bool:
-        """POST /api/audio/play (v1.5.2, added for calendar_countdown's
-        event-start chirp). Exactly one of `stock_path` (a firmware-shipped
-        sound, e.g. "shared/calendar_event_starts.snd" -- pattern
-        `shared/[a-z0-9_.]+$`, no further subdirectories) or `path` (a file
-        previously uploaded into this app's own assets directory) must be
-        given, matching the device's own PlayAudio schema. Never touches
-        `/api/audio/volume` -- this method has no volume parameter at all,
-        deliberately, so a caller can't accidentally change the operator's
-        own volume setting; playback always uses whatever volume is
-        currently configured on the device.
+    def play_audio(self, application_name: str, stock_path: str | None = None, path: str | None = None) -> bool:
+        """Queue one sound without changing the device's volume setting.
 
-        **Stock sound filenames are `.snd` at runtime, not `.wav`, even
-        though the source assets in the firmware repo are `.wav` files.**
-        The build pipeline converts `.wav` sources to `.snd` at packaging
-        time; the source tree and the OpenAPI spec never reveal this --
-        the only way to find the real runtime filename is a live `GET
-        /api/storage/list` of the target directory (e.g.
-        `/ext/apps_assets/shared/sounds`) against the actual device.
-        Always verify a stock filename against that listing before
-        shipping it in a `stock_path`, not against the source repo or the
-        API docs.
-
-        **A `True` return does NOT prove audible playback.** This
-        endpoint returns `200` BEFORE the actual file open -- playback is
-        queued behind a short amp holdoff (~100ms), and an open failure
-        at holdoff-fire (e.g. because the filename is wrong) is logged
-        device-side only and otherwise swallowed; nothing comes back over
-        this HTTP response either way. A wrong filename (confirmed with
-        the original, incorrect `.wav` stock_path used here before this
-        was diagnosed) is therefore indistinguishable from a correct one
-        at every layer this codebase can observe -- the request succeeds,
-        the response is `200`, and `play_audio` returns `True`, with no
-        actual sound. The only way to confirm real audibility is a human
-        listening on the actual hardware; log every attempt's outcome
-        (both `True` and `False`) at the call site so a silent-but-
-        "successful" chirp is at least visible in the log for later
-        correlation against an operator report, rather than doubly silent
-        (no sound AND no log line) the way the original bug was.
-
-        Returns True on a confirmed 200, False on anything else (network
-        unreachable, 400 invalid path, 404 file not found, or any other
-        non-200) -- best-effort, non-fatal by design: a caller should log
-        the outcome but never let an audio failure block or crash the
-        display loop (the same "audio failure may occur after display
-        content is visible" tolerance the device's own client libraries
-        document for this endpoint).
+        A 200 acknowledges the queued request, not audible playback. In
+        particular, firmware stock paths are runtime ``.snd`` assets rather
+        than their source-tree ``.wav`` names. A read or connection failure is
+        treated as uncertain and is never replayed to another route.
         """
-        body: dict = {"application_name": application_name}
-        if stock_path is not None:
-            body["stock_path"] = stock_path
-        elif path is not None:
-            body["path"] = path
-        else:
+        if (stock_path is None) == (path is None):
             raise ValueError("play_audio requires exactly one of stock_path or path")
-        resp = self._request("POST", "/api/audio/play", json=body)
-        if resp is None:
-            log.debug("play_audio: device unreachable")
-            return False
-        if resp.status_code == 200:
-            return True
-        log.warning("play_audio failed: HTTP %s %s", resp.status_code, resp.text[:200])
-        return False
+        body: dict[str, str] = {"application_name": application_name}
+        body["stock_path" if stock_path is not None else "path"] = stock_path if stock_path is not None else path  # type: ignore[assignment]
+        response = self._request("POST", "/api/audio/play", json=body, replay_safe=False)
+        return response is not None and response.status_code == 200
 
     def clear(self, application_name: str) -> bool:
-        resp = self._request("DELETE", "/api/display/draw",
-                             params={"application_name": application_name})
-        return resp is not None and resp.status_code == 200
+        if not application_name:
+            raise ValueError("clear requires an application_name")
+        response = self._request("DELETE", "/api/display/draw", params={"application_name": application_name})
+        return response is not None and response.status_code == 200
+
+    def remove_elements(self, application_name: str, ids: list[str]) -> bool:
+        """Delete named elements without sending the firmware-buggy body owner."""
+        if not application_name:
+            raise ValueError("remove_elements requires an application_name")
+        if not ids:
+            return True
+        if self.transport == "cloud" or self.active_transport == "cloud" or not self.supports_display_v2:
+            return False
+        response = self._request(
+            "DELETE", "/api/display/draw", local_only=True,
+            params={"application_name": application_name}, json={"element_ids": ids},
+        )
+        return response is not None and response.status_code == 200
 
     def upload_asset(self, application_name: str, filename: str, data: bytes) -> bool:
-        """Upload a raw asset (e.g. a compiled .anim) to the device's app asset
-        store. Local-only: assets live on the physical device, so this never
-        uses the cloud transport. Returns True on HTTP 200."""
-        resp = self._try_local(
-            "POST",
-            f"/api/assets/upload?application_name={application_name}&file={filename}",
-            data=data, headers={"Content-Type": "application/octet-stream"})
-        if resp is None:
-            log.warning("asset upload unreachable: %s/%s", application_name, filename)
+        path = PurePosixPath(filename)
+        if path.is_absolute() or ".." in path.parts or filename in ("", "."):
             return False
-        if resp.status_code != 200:
-            log.warning("asset upload failed: HTTP %s %s", resp.status_code, resp.text[:200])
-        return resp.status_code == 200
+        response = self._request(
+            "POST", "/api/assets/upload", local_only=True,
+            params={"application_name": application_name, "file": filename}, data=data,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        return response is not None and response.status_code == 200
+
+    @staticmethod
+    def _json_dict(response: requests.Response | None) -> dict | None:
+        if response is None or response.status_code != 200:
+            return None
+        try:
+            value = response.json()
+        except ValueError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def get_json(self, path: str, *, local_only: bool = False) -> dict | None:
+        if path not in {
+            "/api/status", "/api/version", "/api/busy/snapshot",
+            "/api/transport", "/api/status/firmware", "/api/status/power",
+        }:
+            raise ValueError("unsupported diagnostic endpoint")
+        return self._json_dict(self._request("GET", path, local_only=local_only))
+
+    def get_bytes(self, path: str, *, local_only: bool = True) -> bytes | None:
+        """Read a fixed diagnostic byte stream, currently the front/back screen."""
+        if path not in {"/api/screen?display=0", "/api/screen?display=1"}:
+            raise ValueError("unsupported diagnostic endpoint")
+        if not local_only:
+            raise ValueError("screen diagnostics are local only")
+        response = self._request("GET", path, local_only=local_only)
+        return response.content if response is not None and response.status_code == 200 else None
+
+    def refresh_capabilities(self) -> bool:
+        now = time.monotonic()
+        if self._capabilities_checked_at is not None and now - self._capabilities_checked_at < LOCAL_RETRY_SECONDS:
+            return self.supports_display_v2
+        self._capabilities_checked_at = now
+        self.supports_display_v2 = False
+        if self.transport == "cloud" or self.active_transport == "cloud":
+            return False
+        version = self.get_json("/api/version", local_only=True)
+        if version is not None:
+            self.supports_display_v2 = _version_at_least(version.get("api_semver"), (27, 5, 0))
+        return self.supports_display_v2
 
     def status(self) -> dict | None:
-        resp = self._request("GET", "/api/status")
-        return resp.json() if resp is not None and resp.status_code == 200 else None
+        return self.get_json("/api/status")
 
     def get_busy(self) -> dict | None:
-        resp = self._request("GET", "/api/busy/snapshot")
-        return resp.json() if resp is not None and resp.status_code == 200 else None
+        return self.get_json("/api/busy/snapshot")
 
     def set_busy_simple(self, time_left_ms: int) -> bool:
-        """PUT /api/busy/snapshot to start a SIMPLE BUSY session (used by
-        calendar_countdown's auto_busy=true feature).
+        """Start a SIMPLE BUSY session using the firmware's nested snapshot.
 
-        The device's /openapi.yaml documents BusySnapshot as the
-        discriminated snapshot variant merged (via allOf) with a required
-        top-level `busy_bar_settings`, sent flat -- that is the shape this
-        method sent before this fix. Empirically, against a live device,
-        that flat body gets HTTP 400 "Failed to parse snapshot" every
-        time. The shape the firmware actually accepts mirrors what
-        get_busy() (GET, unaffected by this bug) returns: the snapshot
-        variant nested under a "snapshot" key, sibling to a top-level
-        "snapshot_timestamp_ms" -- and, on this write path, WITHOUT
-        `busy_bar_settings` at all, despite the spec marking it required.
-        Confirmed on-device: the nested body with no `busy_bar_settings`
-        returns 200 and the session actually starts (visible in a
-        subsequent get_busy() snapshot).
-
-        `snapshot_timestamp_ms` must be a genuinely current timestamp, not
-        a stale or placeholder value -- also confirmed on-device: PUTting
-        this same nested body with a stale `snapshot_timestamp_ms` (e.g.
-        one copied from a prior GET) still returns HTTP 200, but the
-        write silently no-ops and the busy state does not actually
-        change. Always send `time.time()`-derived "now", never a fixed
-        or cached value.
+        The timestamp must be current: the device can return 200 for a stale
+        timestamp while applying no state change. Because this writes device
+        state, uncertain send/read failures are not replayed.
         """
         body = {
-            "snapshot": {"type": "SIMPLE", "card_id": NULL_CARD_ID,
-                        "time_left_ms": time_left_ms, "is_paused": False},
+            "snapshot": {"type": "SIMPLE", "card_id": NULL_CARD_ID, "time_left_ms": time_left_ms, "is_paused": False},
             "snapshot_timestamp_ms": int(time.time() * 1000),
         }
-        resp = self._request("PUT", "/api/busy/snapshot", json=body)
-        return resp is not None and resp.status_code == 200
+        response = self._request("PUT", "/api/busy/snapshot", json=body, replay_safe=False)
+        return response is not None and response.status_code == 200
