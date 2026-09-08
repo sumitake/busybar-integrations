@@ -134,13 +134,22 @@ def test_capability_needs_positive_evidence():
 
 @pytest.mark.parametrize("kind", ["fail", "stuck", "green"])
 def test_bitmap_has_transparent_margin_and_does_not_obscure_fallback_text(kind):
-    original = [text_element("ci")]
+    original = [
+        {**text_element("ci_header"), "x": 2, "y": -2, "width": 68},
+        {**text_element("ci"), "x": 2, "y": 6, "width": 68},
+    ]
     frame = ci_bitmap_accent(original, kind, 10)
     icon = frame[-1]
     lines = icon["data"].splitlines()
     assert lines[:3] == ["! XPM2", "7 7 2 1", ". c None"]
     assert len(lines[4:]) == 7 and all(len(row) == 7 for row in lines[4:])
-    assert icon["x"] + 7 <= frame[0]["x"]
-    assert frame[0]["x"] + frame[0]["width"] == 72
+    assert icon["x"] == 2 and icon["y"] == 0
+    assert frame[0]["x"] == 12 and frame[0]["width"] == 58
+    assert frame[1]["x"] == 2 and frame[1]["width"] == 68
+    color = {"fail": "#FFFFFF", "stuck": "#FFCB6B", "green": "#6FFFCF"}[kind]
+    assert f"X c {color}" in lines
     assert icon["timeout"] == 10
-    assert original == [text_element("ci")]
+    assert original == [
+        {**text_element("ci_header"), "x": 2, "y": -2, "width": 68},
+        {**text_element("ci"), "x": 2, "y": 6, "width": 68},
+    ]

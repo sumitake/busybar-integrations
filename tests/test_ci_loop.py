@@ -29,9 +29,9 @@ def _run(conclusion: str) -> dict:
             "conclusion": conclusion, "created_at": "2026-08-03T13:30:00Z"}
 
 
-def _drawn_text(client) -> str:
+def _drawn_texts(client) -> list[str]:
     els = client.draw.call_args.kwargs.get("elements") or client.draw.call_args.args[1]
-    return next(e["text"] for e in els if e.get("type") == "text")
+    return [e["text"] for e in els if e.get("type") == "text"]
 
 
 def test_draws_red_on_failure():
@@ -40,7 +40,8 @@ def test_draws_red_on_failure():
     summary = run_once(client, poller, CFG, NOW, {}, dry_run=False)
     assert client.draw.call_args.kwargs["priority"] == PRIORITY_OVERLAY  # 21, not 60
     assert client.draw.call_args.kwargs["led_notification_color"] == "#FF0000FF"
-    assert "FAIL" in summary
+    assert "CI FAIL" in summary
+    assert CFG["ci_status"]["repos"][0] in summary
 
 
 def test_failure_rotates_with_no_running_job():
@@ -95,7 +96,8 @@ def test_green_folds_into_rotation_at_overlay_tier():
     cfg = {"ci_status": {**CFG["ci_status"], "show_green": True}}
     run_once(client, poller, cfg, NOW, {}, dry_run=False, overlay_state={})
     assert client.draw.call_args.kwargs["priority"] == PRIORITY_OVERLAY
-    assert "ok" in _drawn_text(client)
+    assert "CI OK" in _drawn_texts(client)
+    assert "ALL CLEAR" in _drawn_texts(client)
 
 
 def test_clears_when_green():
@@ -296,10 +298,10 @@ def test_overlay_state_resets_when_run_ends():
 # --- unified shape tracking across alert / quiet-green / overlay tiers ----------
 
 def test_overlay_then_alert_clears_stale_overlay_shape():
-    # Running badge draws first (shape {bg,title,track,track_fill,eta});
+    # Running badge draws first (shape {bg,title,track,track_fill,track_tip,eta});
     # the next poll turns up a failure. Once the rotation's next dwell slot
-    # lands on the failure frame (shape {bg,ci}), the stale
-    # title/track/track_fill/eta ink from the badge must be cleared first --
+    # lands on the failure frame (shape {bg,ci_header,ci_rule,ci}), the stale
+    # title/track/track_fill/track_tip/eta ink from the badge must clear first --
     # not left to linger until its own ~1.5x-poll timeout. Both the failure
     # frame and the running badge are now part of the SAME dwell-gated
     # rotation (Request B), so `frame_index` is pinned to 0 to deterministically
@@ -325,9 +327,9 @@ def test_overlay_then_alert_clears_stale_overlay_shape():
     assert client.draw.call_args.kwargs["priority"] == PRIORITY_OVERLAY
 
 def test_alert_then_overlay_clears_stale_alert_shape():
-    # Symmetric direction: an alert draws first (shape {bg,ci}); once it
+    # Symmetric direction: an alert draws first (shape {bg,ci_header,ci_rule,ci}); once it
     # resolves and a run is active, the running badge's shape ({bg,title,
-    # track,track_fill,eta}) differs and must clear the alert's stale
+    # track,track_fill,track_tip,eta}) differs and must clear the alert's stale
     # elements first. The second poll must land at or beyond a full dwell
     # (Request B: the failure frame is dwell-gated like every other overlay
     # frame now, unlike the old unconditionally-drawing alert-tier path).
@@ -349,11 +351,8 @@ def test_alert_then_overlay_clears_stale_alert_shape():
     client.clear.assert_called_once_with("ci_status")
 
 def test_quiet_green_then_overlay_clears_stale_green_shape():
-    # Quiet "CI ok" text (shape {ci}, no bg) draws first when show_green
-    # is on and nothing is running; once a run starts, the badge's shape
-    # differs (it has a bg + several more ids) and must clear first, or
-    # the old green text -- drawn with a ~1.5x-poll timeout, e.g. 180s at
-    # the default -- would linger behind/around the badge for minutes.
+    # The green card draws first; once a run starts, the badge's shape
+    # differs and must clear before drawing its own full frame.
     # Green now draws at the overlay tier too, so the second poll must
     # land at or beyond a full dwell for its draw to even be attempted.
     client = Mock(); client.draw.return_value = DrawResult.DRAWN
@@ -364,7 +363,7 @@ def test_quiet_green_then_overlay_clears_stale_green_shape():
     summary = run_once(client, poller, CFG_GREEN, NOW, {}, dry_run=False,
                        running_cache={}, overlay_state=overlay_state)
     client.clear.assert_not_called()
-    assert overlay_state["last_shape"] == frozenset({"ci"})
+    assert overlay_state["last_shape"] == frozenset({"bg", "ci_header", "ci_rule", "ci"})
     assert client.draw.call_args.kwargs["priority"] == PRIORITY_OVERLAY
 
     poller.fetch_running_runs.return_value = [_running_run()]
@@ -402,7 +401,7 @@ def test_rotation_cycles_ci_badge_then_quota_frames():
         if "eta" in by_id:
             seen.append("ci_badge")
         else:
-            seen.append("quota_gql" if by_id["title"]["text"] == "GITHUB GRAPHQL" else "quota_rest")
+            seen.append("quota_gql" if by_id["title"]["text"] == "GQL LEFT" else "quota_rest")
         t += timedelta(seconds=2 * OVERLAY_DWELL_SECONDS + 1)
     assert seen == ["ci_badge", "quota_gql", "quota_rest"]
 
@@ -711,11 +710,11 @@ def test_overlay_dwell_rejected_during_calendar_elevation_resumes_after():
                         running_cache={}, overlay_state=overlay_state)
     assert "drawn" in summary2
     assert overlay_state.get("last_dwell_end") is not None
-    assert overlay_state["last_shape"] == frozenset({"bg", "title", "track", "track_fill", "eta"})
+    assert overlay_state["last_shape"] == frozenset({"bg", "title", "track", "track_fill", "track_tip", "eta"})
     assert client.draw.call_count == 2   # both attempts drew (1st rejected, 2nd landed) -- no crash anywhere
 
 
-def test_modern_ci_preserves_text_and_icon_when_failure_background_is_removed():
+def test_modern_ci_draws_complete_green_card_after_failure():
     client = Mock()
     client.supports_display_v2 = True
     client.remove_elements.return_value = True
@@ -730,8 +729,10 @@ def test_modern_ci_preserves_text_and_icon_when_failure_background_is_removed():
     assert state["last_priority"] == PRIORITY_OVERLAY
     poller.fetch_runs.return_value = [_run("success")]
     run_once(client, poller, cfg, NOW + timedelta(seconds=21), {}, False, overlay_state=state)
-    client.remove_elements.assert_called_once_with("ci_status", ["bg"])
+    client.remove_elements.assert_not_called()
     client.clear.assert_not_called()
     frame = client.draw.call_args.args[1]
-    assert {e["id"] for e in frame} == {"ci", "ci_status_icon"}
+    assert {e["id"] for e in frame} == {"bg", "ci_header", "ci_rule", "ci", "ci_status_icon"}
+    by_id = {e["id"]: e for e in frame}
+    assert by_id["ci"]["text"] == "ALL CLEAR"
     assert all(e["timeout"] == 10 for e in frame)

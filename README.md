@@ -7,6 +7,15 @@
 
 Local-API integrations for the BUSY Bar — a 72×16 LED status display on USB or LAN.
 
+## Display design
+
+The **Signal** display style pairs dark backgrounds with bright time readouts,
+consistent status cards, and native animation. Urgent calendar screens retain
+the event title; CI status headings stay fixed while details scroll. Nyan has
+a softer rainbow trail and a seamless star loop. See the
+[design and device captures](docs/display-design.md) for the before/after
+comparison and unchanged priority/handoff behavior.
+
 ## Requirements
 
 - **BUSY Bar** on USB (default address `10.0.4.20`) or LAN

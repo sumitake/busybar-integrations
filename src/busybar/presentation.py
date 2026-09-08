@@ -70,7 +70,7 @@ _ICON_ROWS = {
 
 
 def ci_bitmap_accent(elements: list[dict], kind: str, timeout_s: int) -> list[dict]:
-    """Add an inline 7x7 status symbol beside the existing scrolling CI text.
+    """Add an inline 7x7 status symbol beside the fixed CI header.
 
 These are fixed local assets, not a general image parser. The text remains the
 meaningful fallback if the client must use an older/cloud endpoint mid-draw.
@@ -78,10 +78,10 @@ meaningful fallback if the client must use an older/cloud endpoint mid-draw.
     rows = _ICON_ROWS.get(kind)
     if rows is None:
         return elements
-    colors = {"fail": "#FFFFFF", "stuck": "#0B0B0B", "green": "#00FF00"}
+    colors = {"fail": "#FFFFFF", "stuck": "#FFCB6B", "green": "#6FFFCF"}
     data = "! XPM2\n7 7 2 1\n. c None\nX c " + colors[kind] + "\n" + "\n".join(rows) + "\n"
-    frame = [{**element, "x": 11, "width": 61} if element["id"] == "ci" else dict(element)
+    frame = [{**element, "x": 12, "width": 58} if element["id"] == "ci_header" else dict(element)
              for element in elements]
     frame.append({"id": "ci_status_icon", "type": "xpmbitmap", "data": data,
-                  "x": 1, "y": 4, "timeout": timeout_s})
+                  "x": 2, "y": 0, "timeout": timeout_s})
     return frame

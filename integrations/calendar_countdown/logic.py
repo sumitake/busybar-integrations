@@ -8,7 +8,7 @@ from busybar.display import PRIORITY_AMBIENT, PRIORITY_AMBIENT_RAISED, PRIORITY_
 PANEL_WIDTH = 72
 PANEL_HEIGHT = 16
 
-# --- v1.3 "Color Horizon" state palette --------------------------------------
+# --- "Signal" state palette --------------------------------------
 #
 # Four states, ordered least -> most urgent, with `in_progress` orthogonal to
 # the other three (an event currently happening, regardless of how it got
@@ -22,27 +22,27 @@ STATE_IN_PROGRESS = "in_progress"
 STATES = (STATE_NORMAL, STATE_NOTICE, STATE_WARNING, STATE_IN_PROGRESS)
 
 BG_GRADIENT = {
-    STATE_NORMAL: ["#160A2EFF", "#03040DFF"],
-    STATE_NOTICE: ["#291300FF", "#070301FF"],
-    STATE_WARNING: ["#30040BFF", "#080103FF"],
-    STATE_IN_PROGRESS: ["#032B2CFF", "#010809FF"],
+    STATE_NORMAL: ["#061326FF", "#01030AFF"],
+    STATE_NOTICE: ["#241704FF", "#060401FF"],
+    STATE_WARNING: ["#2B0818FF", "#060208FF"],
+    STATE_IN_PROGRESS: ["#04231CFF", "#010604FF"],
 }
 
 TITLE_COLOR = {
-    STATE_NORMAL: "#FFD166FF",
-    STATE_NOTICE: "#FFE3A3FF",
-    STATE_WARNING: "#FFE7ECFF",
+    STATE_NORMAL: "#F2F7FFFF",
+    STATE_NOTICE: "#FFF2CEFF",
+    STATE_WARNING: "#FFF0F3FF",
     STATE_IN_PROGRESS: "#83FFF3FF",
 }
 
 # The drain track's groove is a single fixed color in every state; only the
 # fill on top of it (TRACK_FILL_GRADIENT / TRACK_FILL_IN_PROGRESS) changes.
-TRACK_COLOR = "#24193BFF"
+TRACK_COLOR = "#142033FF"
 
 TRACK_FILL_GRADIENT = {
-    STATE_NORMAL: ["#1ED6FFFF", "#5CFFB1FF"],
+    STATE_NORMAL: ["#1597FFFF", "#63FFD4FF"],
     STATE_NOTICE: ["#FF9F1CFF", "#FFE66DFF"],
-    STATE_WARNING: ["#FF204EFF", "#FF7A22FF"],
+    STATE_WARNING: ["#FF416EFF", "#FFC070FF"],
 }
 TRACK_FILL_IN_PROGRESS = "#24D6C5FF"
 
@@ -54,23 +54,23 @@ TRACK_FILL_IN_PROGRESS = "#24D6C5FF"
 # failure badge does). The v1.3.1 cards (#062238/#062A22, etc.) were
 # mid-luminance dim fills that read as glow-mud on emissive LEDs, so v1.4
 # removes cards entirely rather than trying to re-tune their luminance.
-TIME_TEXT_COLOR = "#8DDEFFFF"
+TIME_TEXT_COLOR = "#B4CAE6FF"
 
 # Fixed -- only drawn for the in-progress state (replaces time + ends).
 ENDS_TEXT_COLOR = "#8CFFF4FF"
 ENDS_TEXT = "ENDS"
 
 DIVIDER_COLOR = {
-    STATE_NORMAL: "#643B8FFF",
+    STATE_NORMAL: "#284469FF",
     STATE_NOTICE: "#C37A0CFF",
     STATE_WARNING: "#E02A4CFF",
     STATE_IN_PROGRESS: "#178C88FF",
 }
 
 DIGIT_COLOR = {
-    STATE_NORMAL: "#6BFFD0FF",
+    STATE_NORMAL: "#5AF0FFFF",
     STATE_NOTICE: "#FFC247FF",
-    STATE_WARNING: "#FF4B68FF",
+    STATE_WARNING: "#FF6987FF",
     STATE_IN_PROGRESS: "#64FFEAFF",
 }
 
@@ -177,14 +177,8 @@ SCROLL_DELAY_MS = 800
 
 # --- v1.6 stock-animation accents: escalation icons + start-takeover -------
 #
-# ICON_EVENT/ICON_REMINDER are 16x16 stock animations drawn at the panel's
-# top-left corner (ICON_X/ICON_Y) during the upcoming path's WARNING state
-# (see build_elements): ICON_EVENT while still outside imminent_minutes,
-# ICON_REMINDER once inside it (title dropped at that point -- see
-# ICON_TITLE_X below). START_ANIM_ID/CAL_ICON_ID are the element ids these
-# accents draw under; ICON_TITLE_X is where the title shifts to when an
-# icon is present but the title is still shown (leaving x=0..15 clear for
-# the 16x16 icon).
+# The 16x16 warning animation owns x=0..15. The title and track use
+# x=18..71 throughout warning/imminent; the lower row keeps IN + countdown.
 ICON_EVENT = "calendar_event_16x16"
 ICON_REMINDER = "calendar_reminder_16x16"
 ICON_X, ICON_Y = 0, 0
@@ -635,221 +629,79 @@ def _format_countdown(minutes_left: float) -> str:
 
 def build_elements(event: CalEvent, now: datetime, cfg: dict, timeout_s: int,
                    in_progress: bool, just_started: bool = False) -> list[dict]:
-    """Build the v1.4 "airy" Color Horizon layout.
+    """Compose a title, horizon and equal-size time readouts on the native canvas.
 
-    `cfg` is the `[calendar_countdown]` config sub-dict (needs
-    progress_window_minutes, notice_minutes, warn_minutes, and, for the v1.6
-    stock-animation accents, escalation_icons/start_animation/
-    imminent_minutes -- the icon block reads cfg["imminent_minutes"]
-    directly, so it's a hard requirement whenever escalation_icons is on).
-    `in_progress`
-    selects between the "upcoming" layout (countdown to event.start, a
-    large start-time numeral) and the "in-progress" layout (countdown to
-    event.end, an "ENDS" label, full-width non-draining track fill). No
-    card/panel surfaces -- `time` and `cd_text` float directly on `bg` (see
-    the TIME_TEXT_COLOR comment above for why cards were removed in v1.4).
-    The countdown itself (`cd_text`) is a plain `text` element re-rendered
-    from `minutes_left` each poll -- not the native `countdown` element (see
-    the CD_TEXT_X comment above for why). Draw order below is z-order,
-    first = behind.
-
-    `just_started` (v1.6, default False) short-circuits everything above: a
-    full-panel takeover animation (see is_just_started) replaces the normal
-    layout entirely for the start-takeover window, so it's checked first and
-    returns before any of the upcoming/in-progress element-building below.
+    The urgent 16px animation has a reserved lane. Its title stays visible in
+    both warning stages, with a compact IN label beside the large countdown.
+    Text y coordinates include the firmware's measured two-pixel ink offset.
+    Full expiring frames still use the existing priority and redraw contracts.
     """
-    if just_started:
-        bg = {"id": "bg", "type": "rectangle", "x": 0, "y": 0,
-              "width": PANEL_WIDTH, "height": PANEL_HEIGHT, "fill": "gradient_v",
-              "fill_colors": BG_GRADIENT[STATE_IN_PROGRESS], "border_width": 0, "timeout": timeout_s}
-        anim = {"id": START_ANIM_ID, "type": "animation",
-                "stock_path": f"shared/{cfg['start_animation']}.anim",
-                "x": 0, "y": 0, "loop": True, "timeout": timeout_s}
-        return [bg, anim]
-
-    # Uppercase kills descenders (g, y, p, ...), which is what let the title
-    # collide with the track below it before the ink-offset fix -- see the
-    # geometry comment above TITLE_Y.
-    title = ascii_safe(event.title).upper()
-
     minutes_left = _minutes_left(event, now, in_progress)
-
     state = _state_for(minutes_left, cfg["notice_minutes"], cfg["warn_minutes"], in_progress)
+    bg = {"id": "bg", "type": "rectangle", "x": 0, "y": 0,
+          "width": PANEL_WIDTH, "height": PANEL_HEIGHT, "fill": "gradient_v",
+          "fill_colors": BG_GRADIENT[STATE_IN_PROGRESS if just_started else state],
+          "border_width": 0, "timeout": timeout_s}
+    if just_started:
+        return [bg, {"id": START_ANIM_ID, "type": "animation",
+                     "stock_path": f"shared/{cfg['start_animation']}.anim",
+                     "x": 0, "y": 0, "loop": True, "timeout": timeout_s}]
 
-    bg_element = {
-        "id": "bg",
-        "type": "rectangle",
-        "x": 0,
-        "y": 0,
-        "width": PANEL_WIDTH,
-        "height": PANEL_HEIGHT,
-        "fill": "gradient_v",
-        "fill_colors": BG_GRADIENT[state],
-        "border_width": 0,
-        "timeout": timeout_s,
-    }
+    show_icon = not in_progress and cfg.get("escalation_icons") and state == STATE_WARNING
+    title_x = ICON_TITLE_X if show_icon else TITLE_X
+    title_width = PANEL_WIDTH - title_x - 2
+    title_text = ascii_safe(event.title).upper()
+    title = {"id": "title", "type": "text", "text": title_text, "font": "small",
+             "color": TITLE_COLOR[state], "x": title_x, "y": TITLE_Y,
+             "width": title_width, "timeout": timeout_s}
+    if not _title_fits(title_text, title_width):
+        title.update(scroll_rate=SCROLL_RATE, scroll_start_delay=SCROLL_DELAY_MS,
+                     scroll_repeat_delay=SCROLL_DELAY_MS)
 
-    title_element = {
-        "id": "title",
-        "type": "text",
-        "text": title,
-        "font": "small",
-        "color": TITLE_COLOR[state],
-        "x": TITLE_X,
-        "y": TITLE_Y,
-        "width": TITLE_WIDTH,
-        "timeout": timeout_s,
-    }
-    if not _title_fits(title, TITLE_WIDTH):
-        title_element.update({
-            "scroll_rate": SCROLL_RATE,
-            "scroll_start_delay": SCROLL_DELAY_MS,
-            "scroll_repeat_delay": SCROLL_DELAY_MS,
-        })
-
-    # v1.6 escalation icons: a 16x16 stock animation in the WARNING state
-    # (upcoming path only -- in_progress never reaches this state visually
-    # the same way, see _state_for), swapping from the plain event icon to
-    # the reminder icon once inside imminent_minutes. At imminent, the
-    # title is dropped entirely (icon + big countdown number only); before
-    # that, the title just shifts right of the icon (ICON_TITLE_X) with a
-    # narrowed width so it still scrolls in the remaining gap. The `time`
-    # element (start-time text at TIME_X=2/TIME_Y=5) is ALSO dropped
-    # whenever the icon is present -- see the `elif icon_element is None`
-    # branch below -- since it sits under the icon's 16x16 footprint and
-    # would otherwise have its leading digits occluded; this applies to
-    # both the warn and imminent sub-stages, not just imminent.
-    icon_element = None
-    if not in_progress and cfg.get("escalation_icons") and state == STATE_WARNING:
-        imminent = minutes_left <= cfg["imminent_minutes"]
-        icon_name = ICON_REMINDER if imminent else ICON_EVENT
-        icon_element = {"id": CAL_ICON_ID, "type": "animation",
-                        "stock_path": f"shared/{icon_name}.anim",
-                        "x": ICON_X, "y": ICON_Y, "loop": True, "timeout": timeout_s}
-        if imminent:
-            title_element = None          # drop the title at imminent -> icon + big number
-        else:
-            narrowed_width = CD_TEXT_X - ICON_TITLE_X - 2   # scroll in the gap
-            title_element.update({"x": ICON_TITLE_X, "width": narrowed_width})
-            # The scroll decision above was made against the full
-            # TITLE_WIDTH (68px); the icon block just narrowed the title to
-            # `narrowed_width` (19px), so it must be RE-decided against the
-            # narrowed width here -- a title that fits at 68px commonly does
-            # NOT fit at 19px (e.g. "Standup", "Meeting", "Lunch"), and
-            # without this recompute it would keep the no-scroll flags from
-            # the 68px check and clip statically instead of scrolling in the
-            # gap the comment above promises.
-            if not _title_fits(title, narrowed_width):
-                title_element.update({
-                    "scroll_rate": SCROLL_RATE,
-                    "scroll_start_delay": SCROLL_DELAY_MS,
-                    "scroll_repeat_delay": SCROLL_DELAY_MS,
-                })
-            else:
-                title_element.pop("scroll_rate", None)
-                title_element.pop("scroll_start_delay", None)
-                title_element.pop("scroll_repeat_delay", None)
-
-    track_element = {
-        "id": "track",
-        "type": "rectangle",
-        "x": 0,
-        "y": TRACK_Y,
-        "width": PANEL_WIDTH,
-        "height": TRACK_HEIGHT,
-        "fill": "solid",
-        "fill_colors": [TRACK_COLOR],
-        # RectangleElement defaults to a 1px white border, which at this
-        # height would swallow the fill entirely (found on-device in v1.1).
-        "border_width": 0,
-        "timeout": timeout_s,
-    }
-
+    track_x = ICON_TITLE_X if show_icon else 0
+    track_width = PANEL_WIDTH - track_x
     if in_progress:
-        track_fill_width = PANEL_WIDTH
-        track_fill = {"fill": "solid", "fill_colors": [TRACK_FILL_IN_PROGRESS]}
+        duration = (event.end - event.start).total_seconds()
+        fraction = (event.end - now).total_seconds() / duration if duration > 0 else 1.0
+        fill_width = max(1, min(track_width, round(track_width * fraction)))
+        fill = {"fill": "gradient_h", "fill_colors": ["#159987FF", TRACK_FILL_IN_PROGRESS]}
     else:
-        track_fill_width = _track_fill_width(minutes_left, cfg["progress_window_minutes"])
-        track_fill = {"fill": "gradient_h", "fill_colors": TRACK_FILL_GRADIENT[state]}
-    track_fill_element = {
-        "id": "track_fill",
-        "type": "rectangle",
-        "x": 0,
-        "y": TRACK_Y,
-        "width": track_fill_width,
-        "height": TRACK_HEIGHT,
-        "border_width": 0,
-        "timeout": timeout_s,
-        **track_fill,
-    }
-
-    elements = [bg_element]
-    if title_element is not None:
-        elements.append(title_element)
-    elements.append(track_element)
-    elements.append(track_fill_element)
+        fill_width = max(1, min(track_width, round(
+            _track_fill_width(minutes_left, cfg["progress_window_minutes"]) * track_width / PANEL_WIDTH)))
+        fill = {"fill": "gradient_h", "fill_colors": TRACK_FILL_GRADIENT[state]}
+    track = {"id": "track", "type": "rectangle", "x": track_x, "y": TRACK_Y,
+             "width": track_width, "height": TRACK_HEIGHT, "fill": "solid",
+             "fill_colors": [TRACK_COLOR], "border_width": 0, "timeout": timeout_s}
+    track_fill = {**track, "id": "track_fill", "width": fill_width, **fill}
+    tip_width = min(2, fill_width)
+    track_tip = {**track, "id": "track_tip", "x": track_x + fill_width - tip_width,
+                 "width": tip_width, "fill_colors": ["#E9FFFFFF"]}
+    elements = [bg, title, track, track_fill, track_tip]
 
     if in_progress:
-        elements.append({
-            "id": "ends",
-            "type": "text",
-            "text": ENDS_TEXT,
-            "font": "bold",
-            "color": ENDS_TEXT_COLOR,
-            "x": ENDS_X,
-            "y": ENDS_Y,
-            "timeout": timeout_s,
-        })
-    elif icon_element is None:
-        # `time` sits at TIME_X=2, TIME_Y=5 (ink rows 7-15), which overlaps
-        # the escalation icon's 16x16 footprint (x=0..15, y=0..15) -- drop
-        # it whenever the icon is present (both the warn and imminent
-        # sub-stages) rather than let the icon occlude its leading digits.
-        # `cd_text` at CD_TEXT_X=39 already clears the icon and remains the
-        # sole "how much time" readout in that case.
-        elements.append({
-            "id": "time",
-            "type": "text",
-            "text": f"{event.start.astimezone():%H:%M}",
-            "font": "large",
-            "color": TIME_TEXT_COLOR,
-            "x": TIME_X,
-            "y": TIME_Y,
-            "timeout": timeout_s,
-        })
+        elements.append({"id": "ends", "type": "text", "text": ENDS_TEXT, "font": "bold",
+                         "color": ENDS_TEXT_COLOR, "x": ENDS_X, "y": ENDS_Y,
+                         "timeout": timeout_s})
+    elif show_icon:
+        elements.append({"id": "starts_label", "type": "text", "text": "IN", "font": "small",
+                         "color": TITLE_COLOR[state], "x": 20, "y": 9, "timeout": timeout_s})
+    else:
+        elements.append({"id": "time", "type": "text", "text": f"{event.start.astimezone():%H:%M}",
+                         "font": "large", "color": TIME_TEXT_COLOR, "x": TIME_X, "y": TIME_Y,
+                         "timeout": timeout_s})
+    if not show_icon:
+        elements.append({"id": "divider", "type": "rectangle", "x": DIVIDER_X,
+                         "y": DIVIDER_Y, "width": DIVIDER_WIDTH, "height": DIVIDER_HEIGHT,
+                         "fill": "solid", "fill_colors": [DIVIDER_COLOR[state]],
+                         "border_width": 0, "timeout": timeout_s})
 
-    if icon_element is None:
-        # The divider's left neighbor is `time`, which is already dropped
-        # whenever the escalation icon is present (both the warn and
-        # imminent sub-stages, see the `elif icon_element is None` branch
-        # above) -- with `time` gone and `title` narrowed away from it too,
-        # the divider would be orphaned floating alone. Drop it under the
-        # same condition rather than let it draw disconnected from anything.
-        elements.append({
-            "id": "divider",
-            "type": "rectangle",
-            "x": DIVIDER_X,
-            "y": DIVIDER_Y,
-            "width": DIVIDER_WIDTH,
-            "height": DIVIDER_HEIGHT,
-            "fill": "solid",
-            "fill_colors": [DIVIDER_COLOR[state]],
-            "border_width": 0,
-            "timeout": timeout_s,
-        })
-
-    elements.append({
-        "id": "cd_text",
-        "type": "text",
-        "text": _format_countdown(minutes_left),
-        "font": "large",
-        "color": DIGIT_COLOR[state],
-        "x": CD_TEXT_X,
-        "y": CD_TEXT_Y,
-        "timeout": timeout_s,
-    })
-
-    if icon_element is not None:
-        elements.append(icon_element)
-
+    # Keep the calendar's final-minute cue separate from shared ETA formatting.
+    countdown = "<1m" if not in_progress and 0 < minutes_left < 1 else _format_countdown(minutes_left)
+    elements.append({"id": "cd_text", "type": "text", "text": countdown, "font": "large",
+                     "color": DIGIT_COLOR[state], "x": CD_TEXT_X, "y": CD_TEXT_Y,
+                     "width": CD_TEXT_MAX_WIDTH, "timeout": timeout_s})
+    if show_icon:
+        icon = ICON_REMINDER if minutes_left <= cfg["imminent_minutes"] else ICON_EVENT
+        elements.append({"id": CAL_ICON_ID, "type": "animation", "stock_path": f"shared/{icon}.anim",
+                         "x": ICON_X, "y": ICON_Y, "loop": True, "timeout": timeout_s})
     return elements

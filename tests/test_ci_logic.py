@@ -254,10 +254,11 @@ def test_overlay_ci_badge_shape():
     # v1.5.1: a fitting remain-estimate ETA ("~11m" here) picks up the
     # "eta_label" element too -- see test_eta_label_* below for the full
     # fit-decision and grammar-guard coverage.
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta", "eta_label"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "track_tip", "eta", "eta_label"}
     assert [e["id"] for e in payload["elements"]] == \
-        ["bg", "title", "track", "track_fill", "eta", "eta_label"]
+        ["bg", "title", "track", "track_fill", "track_tip", "eta", "eta_label"]
     assert by_id["eta_label"]["text"] == "remain"
+    assert all(element["timeout"] == OVERLAY_DWELL_SECONDS for element in by_id.values())
 
     bg = by_id["bg"]
     assert bg["fill"] == "gradient_v" and bg["border_width"] == 0
@@ -271,8 +272,14 @@ def test_overlay_ci_badge_shape():
     assert track["y"] == 6 and track["width"] == 72 and track["border_width"] == 0
 
     track_fill = by_id["track_fill"]
-    assert track_fill["fill"] == "solid"   # spec: "solid cyan", no gradient
+    assert track_fill["fill"] == "gradient_h"
+    assert track_fill["fill_colors"] == ["#29D6FFFF", "#5CFFB1FF"]
     assert track_fill["width"] == _progress_width(3, 14)
+    tip = by_id["track_tip"]
+    assert tip["fill_colors"] == ["#FFFFFFFF"] and tip["height"] == 1
+    assert tip["width"] == min(2, track_fill["width"])
+    assert tip["x"] == track_fill["x"] + track_fill["width"] - tip["width"]
+    assert tip["timeout"] == OVERLAY_DWELL_SECONDS
 
     eta = by_id["eta"]
     assert eta["font"] == "large" and eta["y"] == 5   # numeral-floor rule: large font
@@ -286,7 +293,7 @@ def test_overlay_ci_badge_shape_no_history_has_no_label():
     info = running_info(run=run_, median_minutes=None)
     payload = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, OVERLAY_DWELL_SECONDS, running=info)
     by_id = _by_id(payload["elements"])
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "eta"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "track_tip", "eta"}
     assert by_id["eta"]["text"] == "3m in"
 
 def test_overlay_ci_badge_title_scrolls_when_long():
@@ -310,25 +317,32 @@ def test_overlay_quota_gql_shape():
     assert payload["priority"] == PRIORITY_OVERLAY
 
     by_id = _by_id(payload["elements"])
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "pct", "reset"}
+    assert set(by_id) == {"bg", "title", "reset_label", "track", "track_fill", "pct", "quota_separator", "reset"}
     assert [e["id"] for e in payload["elements"]] == \
-        ["bg", "title", "track", "track_fill", "pct", "reset"]
+        ["bg", "title", "reset_label", "track", "track_fill", "pct", "quota_separator", "reset"]
 
-    assert by_id["title"]["text"] == "GITHUB GRAPHQL"
-    assert by_id["title"]["font"] == "small"
+    title = by_id["title"]
+    assert title["text"] == "GQL LEFT" and title["font"] == "small"
+    assert (title["x"], title["y"], title["width"]) == (2, -2, 38)
+    reset_label = by_id["reset_label"]
+    assert reset_label["text"] == "RESET" and reset_label["font"] == "small"
+    assert (reset_label["x"], reset_label["y"], reset_label["width"]) == (45, -2, 25)
     assert by_id["pct"]["text"] == "52%"    # floor(2600/5000*100) = 52
     assert by_id["pct"]["font"] == "large"  # numeral-floor rule
     assert by_id["reset"]["text"] == "42m"
     assert by_id["reset"]["font"] == "large"
     assert by_id["track_fill"]["width"] == _quota_used_width(2400, 5000)
     assert by_id["track"]["y"] == 6 and by_id["track"]["border_width"] == 0
+    assert by_id["quota_separator"]["x"] == 35 and by_id["quota_separator"]["y"] == 8
+    assert by_id["quota_separator"]["width"] == 1 and by_id["quota_separator"]["height"] == 7
+    assert all(element["timeout"] == OVERLAY_DWELL_SECONDS for element in by_id.values())
 
 def test_overlay_quota_rest_uses_core_bucket():
     info = quota_info(label="GITHUB REST", limit=5000, remaining=100, used=4900)
     payload = build_overlay_payload({"kind": OVERLAY_FRAME_QUOTA_REST}, OVERLAY_DWELL_SECONDS,
                                     quota_by_bucket={"core": info})
     by_id = _by_id(payload["elements"])
-    assert by_id["title"]["text"] == "GITHUB REST"
+    assert by_id["title"]["text"] == "REST LEFT"
     assert by_id["pct"]["text"] == "2%"
 
 def test_overlay_quota_none_when_bucket_missing():
@@ -344,30 +358,43 @@ def test_overlay_quota_none_when_bucket_missing():
 
 # --- build_overlay_payload: fail/stuck/green frames (descriptor dispatch) -------
 
-def test_fail_frame_is_red_badge_at_overlay_tier():
+def test_fail_frame_has_coral_divider_and_full_context_at_overlay_tier():
     d = {"kind": OVERLAY_FRAME_FAIL, "repo": "o/r", "run": FailingRun("tests", "#42")}
     payload = build_overlay_payload(d, OVERLAY_DWELL_SECONDS)
     assert payload["priority"] == PRIORITY_OVERLAY
-    assert _bg_element(payload["elements"])["fill_colors"] == ["#A32D2DFF"]
-    t = _text_element(payload["elements"])
-    assert t["text"] == "CI FAIL o/r #42 · tests" and t["color"] == "#FFFFFFFF"
+    by_id = _by_id(payload["elements"])
+    assert by_id["bg"]["fill_colors"] == ["#111A2BFF", "#020611FF"]
+    header = by_id["ci_header"]
+    assert header["text"] == "CI FAIL" and header["font"] == "small"
+    assert (header["x"], header["y"], header["width"]) == (2, -2, 68)
+    assert "scroll_rate" not in header
+    assert by_id["ci_rule"]["fill_colors"] == ["#FF7A8AFF"]
+    body = by_id["ci"]
+    assert body["text"] == "o/r #42 tests" and body["font"] == "bold"
+    assert (body["x"], body["y"], body["width"]) == (2, 6, 68)
+    assert all(element["timeout"] == OVERLAY_DWELL_SECONDS for element in by_id.values())
 
 def test_fail_frame_drops_ref_when_empty():
     d = {"kind": OVERLAY_FRAME_FAIL, "repo": "o/r", "run": FailingRun("tests", "")}
-    assert _text_element(build_overlay_payload(d, 10)["elements"])["text"] == "CI FAIL o/r · tests"
+    assert _by_id(build_overlay_payload(d, 10)["elements"])["ci"]["text"] == "o/r tests"
 
 def test_stuck_frame_is_amber_badge_at_overlay_tier():
     d = {"kind": OVERLAY_FRAME_STUCK, "repo": "o/r", "run": FailingRun("deploy", "#7")}
     payload = build_overlay_payload(d, 10)
     assert payload["priority"] == PRIORITY_OVERLAY
-    assert _bg_element(payload["elements"])["fill_colors"] == ["#BA7517FF"]
-    assert _text_element(payload["elements"])["text"] == "CI stuck o/r #7 · deploy"
+    by_id = _by_id(payload["elements"])
+    assert by_id["ci_header"]["text"] == "CI WAIT"
+    assert by_id["ci_rule"]["fill_colors"] == ["#FFCB6BFF"]
+    assert by_id["ci"]["text"] == "o/r #7 deploy"
 
-def test_green_frame_is_quiet_text_at_overlay_tier():
+def test_green_frame_is_static_mint_card_at_overlay_tier():
     payload = build_overlay_payload({"kind": OVERLAY_FRAME_GREEN}, 10)
     assert payload["priority"] == PRIORITY_OVERLAY
-    assert _text_element(payload["elements"])["color"] == "#00FF00FF"
-    assert not any(e["type"] == "rectangle" for e in payload["elements"])
+    by_id = _by_id(payload["elements"])
+    assert by_id["ci_header"]["text"] == "CI OK"
+    assert by_id["ci_rule"]["fill_colors"] == ["#6FFFCFFF"]
+    assert by_id["ci"]["text"] == "ALL CLEAR"
+    assert "scroll_rate" not in by_id["ci"]
 
 def test_sequence_orders_fail_then_stuck_then_badge_then_quota():
     states = [RepoState("o/r", [FailingRun("a", "#1")], [FailingRun("b", "#2")])]
@@ -560,6 +587,12 @@ def test_eta_label_falls_back_to_left_when_remain_does_not_fit():
     assert _text_width_px("~1h00m") == 40
     assert _eta_label("~1h00m") == "left"
 
+def test_eta_label_uses_spinner_budget_when_requested():
+    # The spinner shares the lower-right lane. At its 60px ETA budget,
+    # "remain" no longer fits beside a short ETA, while "left" still does.
+    assert _eta_label("~59m", budget=60) == "left"
+    assert _eta_label("~1h00m", budget=60) is None
+
 def test_eta_label_omitted_when_neither_fits():
     # Synthetic, deliberately-wide input -- _format_eta_text/_format_countdown
     # never actually produce a string this wide in practice (the h+mm full
@@ -615,14 +648,15 @@ def _running():
                        repo="me/repo", other_count=0, median_minutes=8.0, now=SPINNER_NOW)
 
 
-def test_spinner_present_and_title_reserved_when_on():
+def test_spinner_preserves_full_title_and_narrows_eta_when_on():
     p = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, 10, running=_running(), show_spinner=True)
     els = p["elements"]
     spin = next(e for e in els if e["id"] == RUN_SPINNER_ID)
     assert spin["type"] == "animation" and spin["stock_path"] == "shared/spinner_front_8x8.anim"
-    assert spin["x"] == 64 and spin["y"] == 0
+    assert spin["x"] == 64 and spin["y"] == 8
     title = next(e for e in els if e["id"] == "title")
-    assert title["width"] == 60   # reserved so the scrolling title never runs under the spinner
+    assert title["width"] == 68
+    assert next(e for e in els if e["id"] == "eta")["width"] == 60
 
 def test_no_spinner_and_full_title_when_off():
     p = build_overlay_payload({"kind": OVERLAY_FRAME_CI_BADGE}, 10, running=_running(), show_spinner=False)
