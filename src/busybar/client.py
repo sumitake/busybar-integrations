@@ -94,7 +94,6 @@ class BusyBarClient:
                 routes.append(candidate)
         self._static_hosts = routes
         self._discovered_hosts: list[str] = []
-        self._local_index = 0
         self.base = self._base_for(self._static_hosts[0])
         if self.discover:
             self._refresh_discovery()
@@ -104,7 +103,7 @@ class BusyBarClient:
         return host if host.startswith(("http://", "https://")) else f"http://{host}"
 
     def _all_local_hosts(self) -> list[str]:
-        return (self._static_hosts + [h for h in self._discovered_hosts if h not in self._static_hosts])[:4]
+        return self._static_hosts + [h for h in self._discovered_hosts if h not in self._static_hosts]
 
     def _mark_degraded(self) -> None:
         if self.active_transport != "cloud":
@@ -152,11 +151,11 @@ class BusyBarClient:
         if not hosts:
             return []
         now = time.monotonic()
-        if self._local_index and now - self._last_primary_probe >= LOCAL_RETRY_SECONDS:
-            self._last_primary_probe = now
-            return [hosts[0], *[h for h in hosts if h != hosts[0]]]
-        preferred = min(self._local_index, len(hosts) - 1)
-        return [hosts[preferred], *[h for i, h in enumerate(hosts) if i != preferred]]
+        preferred = next((h for h in hosts if self._base_for(h) == self.base), hosts[0])
+        ordered = [preferred, *[h for h in hosts if h != preferred]]
+        if now - self._last_primary_probe >= LOCAL_RETRY_SECONDS:
+            ordered = [hosts[0], *[h for h in ordered if h != hosts[0]]]
+        return ordered[:4]
 
     def _try_local(
         self, method: str, path: str, *, replay_safe: bool, **kwargs: Any
@@ -169,6 +168,8 @@ class BusyBarClient:
             headers["X-API-Token"] = self.local_token
         refreshed = False
         for attempt, route in enumerate(routes):
+            if route == self._static_hosts[0]:
+                self._last_primary_probe = time.monotonic()
             try:
                 response = requests.request(
                     method, f"{self._base_for(route)}{path}", timeout=self.timeout,
@@ -183,19 +184,21 @@ class BusyBarClient:
                 failure = exc
             else:
                 self.base = self._base_for(route)
-                self._local_index = self._all_local_hosts().index(route)
                 return response, None
             if not replay_safe and not isinstance(failure, requests.ConnectTimeout):
                 return None, failure
-            if attempt == len(routes) - 1 and not refreshed:
-                # Refresh once after exhausting stale routes. Append only new
-                # addresses that fit this operation's original four-attempt
-                # budget. Uncertain writes return above, before discovery.
+            if not refreshed and (attempt == len(routes) - 1 or attempt == 2):
+                # Reserve the last attempt for discovery when configured routes
+                # fill the budget. Keep the original remaining routes if no
+                # discovery candidate is available; never retry an attempted
+                # address. Uncertain writes return above, before discovery.
                 self._refresh_discovery()
                 refreshed = True
-                for candidate in self._local_order():
-                    if candidate not in routes and len(routes) < 4:
-                        routes.append(candidate)
+                remaining: list[str] = []
+                for candidate in [*self._discovered_hosts, *routes[attempt + 1:]]:
+                    if candidate not in routes[:attempt + 1] and candidate not in remaining:
+                        remaining.append(candidate)
+                routes[attempt + 1:] = remaining[:3 - attempt]
         return None, failure
 
     def _try_cloud(self, method: str, path: str, **kwargs: Any) -> requests.Response | None:

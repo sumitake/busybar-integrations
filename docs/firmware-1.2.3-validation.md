@@ -7,7 +7,7 @@ commit `2cd7ec8abf8479ba3398241e99d291ec24f2a96f`.
 ## Automated checks
 
 - Existing baseline: 374 passing tests.
-- Implementation: 427 passing tests, including existing calendar/CI/Nyan
+- Implementation: 433 passing tests, including existing calendar/CI/Nyan
   behavior and new transport, discovery, presentation and diagnostic cases.
 - Source distribution and wheel built successfully with `uv build`.
 - Python compilation and `git diff --check` passed.
@@ -76,6 +76,16 @@ without exceeding four total attempts or replaying an uncertain write. Tests
 and live reads verified both corrections. Formal reviews, all inline threads,
 issue comments and applicable check annotations were inventoried before the
 patch; CodeRabbit's skipped review was not counted as approval.
+
+The second complete GitHub batch (head `15acd5e`, inventory cutoff
+2026-09-08 22:07 UTC) identified two further route-selection defects. The
+primary recovery interval now starts at the actual primary attempt, so an
+immediate one-shot operation uses the known-working fallback. A full four-route
+configuration reserves its last attempt for an untried discovery candidate,
+while preserving the fourth configured route when discovery has no candidate.
+The preferred address uses the existing successful endpoint rather than a list
+index. Astra reviewed this bounded design; no new retry service or state
+machine was added. The four-attempt limit and uncertain-write stop remain.
 
 A logical Gemini final repository advisory returned **PROCEED**. The earlier
 follow-up design call was unavailable because of nested host sandbox failure;

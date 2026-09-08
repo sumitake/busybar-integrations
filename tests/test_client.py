@@ -579,7 +579,7 @@ def test_bitmap_only_is_supported_locally_without_empty_cloud_fallback(mock_requ
 def test_discovered_routes_cannot_expand_total_route_budget():
     client = BusyBarClient(fallback_hosts=["192.0.2.1", "192.0.2.2", "192.0.2.3"])
     client._discovered_hosts = ["192.0.2.4", "192.0.2.5"]
-    assert len(client._all_local_hosts()) == 4
+    assert len(client._local_order()) == 4
 
 
 @patch("busybar.client.requests.request")
@@ -635,3 +635,60 @@ def test_discovery_refresh_cannot_exceed_four_attempts_or_replay_uncertain_audio
         assert client.play_audio("app", stock_path="sound.snd") is False
     assert mock_request.call_count == 1
     scan.assert_not_called()
+
+
+@patch("busybar.client.time.monotonic", return_value=1000.0)
+@patch("busybar.client.requests.request")
+def test_working_fallback_is_retained_until_primary_recovery_interval(mock_request, clock):
+    client = BusyBarClient(host="192.0.2.1", fallback_hosts=["192.0.2.2"])
+    mock_request.side_effect = [requests.ReadTimeout(), _response(200), _response(200)]
+    assert client.status() == {}
+    clock.return_value = 1001.0
+    assert client.play_audio("app", stock_path="sound.snd") is True
+    assert mock_request.call_args.args[1].startswith("http://192.0.2.2/")
+    clock.return_value = 1060.0
+    mock_request.side_effect = None
+    mock_request.return_value = _response(200)
+    assert client.status() == {}
+    assert mock_request.call_args.args[1].startswith("http://192.0.2.1/")
+
+
+@patch("busybar.client.requests.request")
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("audio", [False, True])
+def test_full_static_routes_reserve_last_attempt_for_discovery(mock_request, cached, audio):
+    from busybar.discovery import DiscoveredDevice
+    client = BusyBarClient(host="192.0.2.1", fallback_hosts=["192.0.2.2", "192.0.2.3", "192.0.2.4"])
+    client.discover = True
+    client.device_id = "aabbccddeeff"
+    record = DiscoveredDevice(client.device_id, "busybar-aabbccddeeff._http._tcp.local.", ("192.0.2.9",), 80)
+    if cached:
+        client._discovered_hosts = ["192.0.2.9"]
+        client._last_discovery = __import__("time").monotonic()
+    mock_request.side_effect = [requests.ConnectTimeout(), requests.ConnectTimeout(), requests.ConnectTimeout(), _response(200)]
+    with patch("busybar.discovery.discover_devices", return_value=[record]):
+        result = client.play_audio("app", stock_path="sound.snd") if audio else client.status()
+    assert result == (True if audio else {})
+    assert [call.args[1].split("/")[2] for call in mock_request.call_args_list] == [
+        "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.9"]
+    # A successful discovered route remains preferred despite full static config.
+    mock_request.side_effect = None
+    mock_request.return_value = _response(200)
+    assert client.play_audio("app", stock_path="sound.snd") is True
+    assert mock_request.call_args.args[1].startswith("http://192.0.2.9/")
+
+
+@patch("busybar.client.time.monotonic", return_value=1060.0)
+@patch("busybar.client.requests.request")
+def test_primary_recovery_probe_preserves_successful_discovered_route(mock_request, clock):
+    client = BusyBarClient(host="192.0.2.1", fallback_hosts=["192.0.2.2", "192.0.2.3", "192.0.2.4"])
+    client._discovered_hosts = ["192.0.2.8", "192.0.2.9"]
+    client.base = "http://192.0.2.9"
+    client._last_primary_probe = 1000.0
+    # Computing order does not consume the recovery interval.
+    assert client._local_order()[:2] == ["192.0.2.1", "192.0.2.9"]
+    assert client._last_primary_probe == 1000.0
+    mock_request.side_effect = [requests.ConnectTimeout(), _response(200)]
+    assert client.play_audio("app", stock_path="sound.snd") is True
+    assert mock_request.call_count == 2
+    assert mock_request.call_args.args[1].startswith("http://192.0.2.9/")
