@@ -265,7 +265,10 @@ def run_once(client, poller, cfg: dict, now: datetime,
         overlay_state["frame_index"] = frame_index + 1
         overlay_state["last_dwell_end"] = now + timedelta(seconds=OVERLAY_DWELL_SECONDS)
 
-    text = next(e["text"] for e in payload["elements"] if e["type"] == "text")
+    text = next(e["text"] for e in payload["elements"]
+                if e["type"] == "text" and e["id"] != "ci_header")
+    header = next((e["text"] for e in payload["elements"] if e["id"] == "ci_header"), "")
+    text = f"{header} {text}".strip()
     return f"{text[:40]!r} -> {result.value}"
 
 

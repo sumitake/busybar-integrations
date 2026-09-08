@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime, timedelta, timezone
 import sys
 from pathlib import Path
@@ -213,11 +214,11 @@ def test_build_elements_upcoming_shape():
     els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=False)
     by_id = {el["id"]: el for el in els}
     # v1.4 "airy": no card elements -- time_card and cd_card are gone.
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "track_tip", "time", "divider", "cd_text"}
     # Draw order is z-order (first = behind); set-membership alone wouldn't
     # catch a reorder that visually breaks layering.
     assert [el["id"] for el in els] == [
-        "bg", "title", "track", "track_fill", "time", "divider", "cd_text",
+        "bg", "title", "track", "track_fill", "track_tip", "time", "divider", "cd_text",
     ]
 
     bg = by_id["bg"]
@@ -325,12 +326,12 @@ def test_build_elements_in_progress_shape():
     e = ev(-5, dur_min=30, title="Standup")
     els = build_elements(e, NOW, CFG, timeout_s=90, in_progress=True)
     by_id = {el["id"]: el for el in els}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text"}
     assert "time" not in by_id  # no start-time label while in progress
     # Draw order is z-order (first = behind); see the upcoming-shape test
     # for why set-membership alone isn't enough to catch a reorder.
     assert [el["id"] for el in els] == [
-        "bg", "title", "track", "track_fill", "ends", "divider", "cd_text",
+        "bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text",
     ]
 
     bg = by_id["bg"]
@@ -341,9 +342,9 @@ def test_build_elements_in_progress_shape():
     assert title["text"] == "STANDUP"
 
     track_fill = by_id["track_fill"]
-    assert track_fill["fill"] == "solid"
-    assert track_fill["fill_colors"] == [TRACK_FILL_IN_PROGRESS]
-    assert track_fill["width"] == PANEL_WIDTH   # no drain while in progress
+    assert track_fill["fill"] == "gradient_h"
+    assert track_fill["fill_colors"][-1] == TRACK_FILL_IN_PROGRESS
+    assert track_fill["width"] == 60   # 25 of 30 minutes remaining
 
     ends = by_id["ends"]
     assert ends["type"] == "text" and ends["font"] == "bold"
@@ -763,30 +764,27 @@ def test_icon_present_drops_time_element():
     assert any(e["id"] == "divider" for e in no_icon_els)
 
 
-def test_warn_stage_title_scrolls_in_narrowed_icon_gap():
-    # "STANDUP" (7 chars * SMALL_FONT_CHAR_PX=5 -> 35px) fits the full 68px
-    # TITLE_WIDTH the scroll decision is first made against, but does NOT
-    # fit the icon-narrowed gap the escalation-icon block later shrinks the
-    # title into (CD_TEXT_X - ICON_TITLE_X - 2 = 39 - 18 - 2 = 19px). The
-    # scroll decision must be recomputed against the NARROWED width, or a
-    # title that's the common case (most real meeting titles) gets no
-    # scroll flags and is statically clipped in the 19px band -- contradicting
-    # the code's own "# scroll in the gap" comment (CODE-BUG-A).
-    warn_ev = _ev(NOW2 + timedelta(minutes=4))   # 4m out -> warn, > imminent
-    els = build_elements(warn_ev, NOW2, _cfg(), 15, in_progress=False)
-    title_el = next(e for e in els if e["id"] == "title")
-    assert title_el["text"] == "STANDUP"
-    assert "scroll_rate" in title_el
-    assert title_el["scroll_rate"] == SCROLL_RATE
-    assert title_el["scroll_start_delay"] == SCROLL_DELAY_MS
-    assert title_el["scroll_repeat_delay"] == SCROLL_DELAY_MS
+def test_warning_title_uses_full_reserved_lane_and_scrolls_only_when_needed():
+    event = _ev(NOW2 + timedelta(minutes=4))
+    frame = {e["id"]: e for e in build_elements(event, NOW2, _cfg(), 15, False)}
+    assert frame["title"]["text"] == "STANDUP"
+    assert (frame["title"]["x"], frame["title"]["width"]) == (18, 52)
+    assert "scroll_rate" not in frame["title"]
+    event.title = "Quarterly planning review"
+    frame = {e["id"]: e for e in build_elements(event, NOW2, _cfg(), 15, False)}
+    assert frame["title"]["scroll_rate"] == SCROLL_RATE
+    assert frame["title"]["scroll_start_delay"] == SCROLL_DELAY_MS
 
-def test_imminent_stage_uses_reminder_icon_and_drops_title():
-    ev = _ev(NOW2 + timedelta(seconds=30))  # 0.5m out -> imminent
-    els = build_elements(ev, NOW2, _cfg(), 15, in_progress=False)
-    icon = next(e for e in els if e["id"] == CAL_ICON_ID)
-    assert icon["stock_path"] == f"shared/{ICON_REMINDER}.anim"
-    assert not any(e["id"] == "title" for e in els)   # title dropped at imminent
+
+def test_imminent_keeps_event_context_and_reads_less_than_one_minute():
+    event = _ev(NOW2 + timedelta(seconds=30))
+    frame = {e["id"]: e for e in build_elements(event, NOW2, _cfg(), 15, False)}
+    assert frame[CAL_ICON_ID]["stock_path"] == f"shared/{ICON_REMINDER}.anim"
+    assert frame["title"]["text"] == "STANDUP"
+    assert frame["starts_label"]["text"] == "IN"
+    assert frame["cd_text"]["text"] == "<1m"
+    assert _format_countdown(.5) == "0m"  # shared CI formatting is unchanged
+
 
 def test_just_started_returns_takeover_animation():
     ev = _ev(NOW2 - timedelta(seconds=10))
@@ -799,3 +797,25 @@ def test_escalation_icons_off_is_unchanged():
     ev = _ev(NOW2 + timedelta(minutes=4))
     els = build_elements(ev, NOW2, _cfg(escalation_icons=False), 15, in_progress=False)
     assert not any(e["id"] == CAL_ICON_ID for e in els)
+
+
+@pytest.mark.parametrize("minutes", [0, .01, .5, 1, 4, 15, 60, 90])
+def test_progress_highlight_and_warning_lane_stay_within_track(minutes):
+    event = _ev(NOW2 + timedelta(minutes=minutes))
+    frame = {e["id"]: e for e in build_elements(event, NOW2, _cfg(), 15, False)}
+    track, fill, tip = (frame[k] for k in ("track", "track_fill", "track_tip"))
+    assert track["x"] <= fill["x"] <= tip["x"]
+    assert tip["x"] + tip["width"] <= fill["x"] + fill["width"] <= track["x"] + track["width"] <= 72
+    assert tip["height"] == 1 and tip["border_width"] == 0
+    assert all(e["timeout"] == 15 for e in frame.values())
+    if CAL_ICON_ID in frame:
+        assert track["x"] >= 18 and frame["title"]["x"] >= 18
+
+
+def test_active_event_progress_drains_and_handles_invalid_duration():
+    event = ev(-15, dur_min=30)
+    frame = {e["id"]: e for e in build_elements(event, NOW, CFG, 15, True)}
+    assert frame["track_fill"]["width"] == 36
+    event.end = event.start
+    frame = {e["id"]: e for e in build_elements(event, NOW, CFG, 15, True)}
+    assert frame["track_fill"]["width"] == 72

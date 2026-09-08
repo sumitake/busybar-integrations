@@ -46,7 +46,7 @@ def test_draws_countdown_for_upcoming_event():
     assert kwargs["priority"] == PRIORITY_AMBIENT == 20
     by_id = {el["id"]: el for el in kwargs["elements"]}
     # v1.4 "airy": no card elements.
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "track_tip", "time", "divider", "cd_text"}
     assert by_id["cd_text"]["text"] == _format_countdown((event.start - NOW).total_seconds() / 60)
     assert by_id["title"]["text"] == "STANDUP"   # uppercased after ascii_safe
     assert "drew" in summary
@@ -59,7 +59,7 @@ def test_draws_in_progress_event_targeting_active_over_upcoming():
     summary = run_once(client, lambda hours: [active, upcoming], CFG, NOW, dry_run=False)
     kwargs = client.draw.call_args.kwargs
     by_id = {el["id"]: el for el in kwargs["elements"]}
-    assert set(by_id) == {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"}
+    assert set(by_id) == {"bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text"}
     assert by_id["title"]["text"] == "ACTIVE"
     assert by_id["cd_text"]["text"] == _format_countdown((active.end - NOW).total_seconds() / 60)
     assert "time" not in by_id
@@ -98,7 +98,7 @@ def test_no_clear_on_first_draw_with_fresh_state():
     # (state["last_shape"]) -- see main.run_once's docstring. The upcoming
     # layout's id set (no icon: CFG has no "escalation_icons" key).
     assert state["last_shape"] == frozenset(
-        {"bg", "title", "track", "track_fill", "time", "divider", "cd_text"})
+        {"bg", "title", "track", "track_fill", "track_tip", "time", "divider", "cd_text"})
 
 def test_no_clear_across_polls_with_same_state():
     client = Mock()
@@ -118,7 +118,7 @@ def test_clears_on_upcoming_to_in_progress_transition():
     client.clear.assert_called_once_with("calendar_countdown")
     # v1.6: the in-progress layout's id set ("ends" instead of "time").
     assert state["last_shape"] == frozenset(
-        {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
+        {"bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text"})
 
 def test_clears_on_in_progress_to_upcoming_transition():
     client = Mock()
@@ -148,8 +148,8 @@ def test_failed_draw_leaves_state_unchanged_and_retries_next_poll():
     client = Mock()
     client.draw.return_value = DrawResult.DRAWN
     state = {}
-    upcoming_shape = frozenset({"bg", "title", "track", "track_fill", "time", "divider", "cd_text"})
-    in_progress_shape = frozenset({"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
+    upcoming_shape = frozenset({"bg", "title", "track", "track_fill", "track_tip", "time", "divider", "cd_text"})
+    in_progress_shape = frozenset({"bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text"})
     run_once(client, lambda hours: [make_event(23)], CFG, NOW, dry_run=False, state=state)
     assert state["last_shape"] == upcoming_shape
 
@@ -187,7 +187,7 @@ def test_clear_failure_does_not_block_state_commit_when_draw_succeeds():
     run_once(client, lambda hours: [active], CFG, NOW, dry_run=False, state=state)
     client.clear.assert_called_once_with("calendar_countdown")
     assert state["last_shape"] == frozenset(
-        {"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
+        {"bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text"})
 
 def test_state_reset_after_no_event_clear():
     client = Mock()
@@ -541,7 +541,7 @@ def test_shape_change_triggers_clear():
 # FakeClient that returns a chosen DrawResult for the takeover draw (the one
 # carrying START_ANIM_ID) and DRAWN for everything else.
 
-IN_PROGRESS_SHAPE = frozenset({"bg", "title", "track", "track_fill", "ends", "divider", "cd_text"})
+IN_PROGRESS_SHAPE = frozenset({"bg", "title", "track", "track_fill", "track_tip", "ends", "divider", "cd_text"})
 
 
 class ResultFakeClient:

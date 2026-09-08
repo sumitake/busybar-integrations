@@ -149,13 +149,13 @@ running spinner implementation details.
 
 ### Failure and Stuck Frames (v1.7)
 
-A failing run draws a full-panel red badge (rounded background + bold
-white text) reading `CI FAIL owner/repo #42 · workflow`; a stale-queued
-run draws the same layout in amber with black text, reading `CI stuck
-owner/repo #42 · workflow`. `#42` is the run's PR number where one
-exists, the branch name when it doesn't (push/fork-triggered runs), or
-dropped entirely (along with its leading space) when neither is
-available. Long text scrolls, same as the running badge. Each failing or
+Failure, waiting, and healthy frames share a dark two-row card. A fixed
+`CI FAIL`, `CI WAIT`, or `CI OK` heading stays visible while the bold lower
+row scrolls the complete `owner/repo #42 workflow` context. Coral, amber, and
+mint divider lines distinguish the states; firmware 1.2.3 adds a matching
+7×7 status icon in the header. The healthy card reads `ALL CLEAR` without
+scrolling. The PR number is replaced by the branch for push/fork runs, or
+omitted if neither exists. Each failing or
 stuck run gets its own frame in the rotation — with several failures or
 stuck runs across repos, expect several red/amber frames in a row before
 the rotation reaches the running badge or quota frames.
@@ -190,17 +190,15 @@ frames, if any:
    fits at all, and which word if so, is a width-based decision (see
    `ci_status/logic.py`'s `_eta_label`); nothing to configure.
    
-   **When `running_spinner` is true (default)**, an animated 8×8 spinner is
-   displayed in the top-right corner of the badge, indicating work in
-   progress. The spinner uses a device stock animation (`spinner_front_8x8`)
-   and animates continuously throughout the run. The title's available width
-   is automatically reduced from 68 to 60 pixels to prevent overlap with the
-   spinner. Set `running_spinner = false` to disable the spinner and revert
-   to text-only display (title width restored to full 68 pixels).
-2. **GraphQL quota** (`show_quota`): title ribbon `GITHUB GRAPHQL`, a track bar
+   **When `running_spinner` is true (default)**, the native 8×8 spinner
+   occupies the lower-right corner. The title keeps its full 68-pixel width;
+   the ETA and its label have a separate 60-pixel budget. A cyan-to-mint track
+   and bright endpoint show elapsed progress. The device animates between
+   ordinary polls; no host animation loop is added.
+2. **GraphQL quota** (`show_quota`): title ribbon `GQL LEFT` with a separate `RESET` label, a track bar
    showing the fraction of the bucket used, and two numerals — percentage
    *remaining* on the left, reset-in on the right (e.g. `18%` / `42m`).
-3. **REST quota** (`show_quota`): identical layout, title ribbon `GITHUB REST`.
+3. **REST quota** (`show_quota`): identical layout, title ribbon `REST LEFT` with the same `RESET` label.
 
 Each quota frame is built from a single `GET /rate_limit` call, fetched
 fresh once per `running_poll_seconds` cycle while a run is active — this

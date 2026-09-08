@@ -198,14 +198,11 @@ RUNNING_NUMERAL_X = OVERLAY_TITLE_X  # the running badge's single numeral sits a
                                     # same left margin as the title/quota "pct" numeral
 
 # Running-badge spinner (v1.6, config-gated via cfg["ci_status"]["running_spinner"]):
-# an animated 8x8 stock asset in the panel's top-right corner. RUNNING_TITLE_WIDTH_SPINNER
-# reserves that corner from the scrolling title so it never runs underneath the spinner --
-# used in place of RUNNING_TITLE_WIDTH, in both the title element's own width and the
-# _title_fits scroll-decision call, whenever show_spinner is on (quota frames never get a
-# spinner, so OVERLAY_TITLE_WIDTH there is untouched).
+# an animated 8x8 stock asset in the lower-right corner. The title keeps the
+# full 68px ribbon; only ETA text narrows to leave the spinner a clear lane.
 RUN_SPINNER_ID = "run_spinner"
 SPINNER_STOCK = "shared/spinner_front_8x8.anim"
-RUNNING_TITLE_WIDTH_SPINNER = 60   # reserve the top-right 8x8 corner (spinner at x=64)
+RUNNING_ETA_WIDTH_SPINNER = 60
 
 
 # --- running-job badge -----------------------------------------------------------
@@ -216,11 +213,11 @@ RUNNING_TITLE_WIDTH_SPINNER = 60   # reserve the top-right 8x8 corner (spinner a
 # The track's own groove color is a decorative element, not a text-bearing
 # surface, so it's allowed to be a touch brighter than the panel background
 # without violating that rule -- same treatment as the calendar's TRACK_COLOR.
-RUNNING_BG_GRADIENT = ["#031A2EFF", "#00060DFF"]
-RUNNING_TITLE_COLOR = "#7FDBFFFF"
-RUNNING_TRACK_COLOR = "#0F2A42FF"
-RUNNING_TRACK_FILL_COLOR = "#29B6F6FF"   # spec: "solid cyan" -- one flat color, no gradient
-RUNNING_NUMERAL_COLOR = "#66E1FFFF"
+RUNNING_BG_GRADIENT = ["#081426FF", "#020611FF"]
+RUNNING_TITLE_COLOR = "#FFFFFFFF"
+RUNNING_TRACK_COLOR = "#13243BFF"
+RUNNING_TRACK_FILL_COLORS = ["#29D6FFFF", "#5CFFB1FF"]
+RUNNING_NUMERAL_COLOR = "#8CFFFFFF"
 
 # ETA label (v1.5.1): a muted gray-blue, deliberately desaturated and
 # dimmer than the bright cyan numeral it sits beside -- a secondary-tier
@@ -308,7 +305,7 @@ def _format_eta_text(run: dict, median_minutes: float | None, now: datetime) -> 
     return f"~{_format_countdown(eta)}"
 
 
-def _eta_label(eta_text: str) -> str | None:
+def _eta_label(eta_text: str, *, budget: int = RUNNING_LABEL_BUDGET_PX) -> str | None:
     """"remain" / "left" / None, appended after a remaining-estimate ETA
     numeral (v1.5.1).
 
@@ -339,7 +336,7 @@ def _eta_label(eta_text: str) -> str | None:
         return None
     eta_width = _text_width_px(eta_text)
     for label in ("remain", "left"):
-        if eta_width + RUNNING_LABEL_GAP_PX + _text_width_px(label) <= RUNNING_LABEL_BUDGET_PX:
+        if eta_width + RUNNING_LABEL_GAP_PX + _text_width_px(label) <= budget:
             return label
     return None
 
@@ -377,18 +374,16 @@ def _build_running_elements(info: RunningInfo, timeout_s: int, show_spinner: boo
     native countdown element, same design lineage as the v1.4 calendar
     layout. Draw order is z-order, first = behind.
 
-    `show_spinner` (v1.6, config-gated): when true, reserves the panel's
-    top-right 8x8 corner from the title ribbon (RUNNING_TITLE_WIDTH_SPINNER
-    in place of RUNNING_TITLE_WIDTH, for both the element's own width and
-    the scroll-fit decision, so the two stay consistent) and appends an
-    animated spinner element there. Defaults to False so existing callers
-    are unaffected.
+    `show_spinner` (v1.6, config-gated): when true, leaves the full title
+    ribbon intact, limits ETA text to 60px, and appends an animated spinner
+    in the lower-right corner. Defaults to False so existing callers are
+    unaffected.
     """
     title_text = _build_running_title(info.run, info.repo, info.other_count)
     eta_text = _format_eta_text(info.run, info.median_minutes, info.now)
     elapsed = _elapsed_minutes(info.run, info.now)
     track_width = _progress_width(elapsed, info.median_minutes)
-    title_width = RUNNING_TITLE_WIDTH_SPINNER if show_spinner else RUNNING_TITLE_WIDTH
+    eta_width = RUNNING_ETA_WIDTH_SPINNER if show_spinner else None
 
     bg_element = {
         "id": "bg", "type": "rectangle", "x": 0, "y": 0,
@@ -399,9 +394,9 @@ def _build_running_elements(info: RunningInfo, timeout_s: int, show_spinner: boo
     title_element = {
         "id": "title", "type": "text", "text": title_text, "font": "small",
         "color": RUNNING_TITLE_COLOR, "x": RUNNING_TITLE_X, "y": RUNNING_TITLE_Y,
-        "width": title_width, "timeout": timeout_s,
+        "width": RUNNING_TITLE_WIDTH, "timeout": timeout_s,
     }
-    if not _title_fits(title_text, title_width):
+    if not _title_fits(title_text, RUNNING_TITLE_WIDTH):
         title_element.update({
             "scroll_rate": SCROLL_RATE,
             "scroll_start_delay": SCROLL_DELAY_MS,
@@ -414,15 +409,23 @@ def _build_running_elements(info: RunningInfo, timeout_s: int, show_spinner: boo
     }
     track_fill_element = {
         "id": "track_fill", "type": "rectangle", "x": 0, "y": RUNNING_TRACK_Y,
-        "width": track_width, "height": RUNNING_TRACK_HEIGHT, "fill": "solid",
-        "fill_colors": [RUNNING_TRACK_FILL_COLOR], "border_width": 0, "timeout": timeout_s,
+        "width": track_width, "height": RUNNING_TRACK_HEIGHT, "fill": "gradient_h",
+        "fill_colors": RUNNING_TRACK_FILL_COLORS, "border_width": 0, "timeout": timeout_s,
     }
     numeral_element = {
         "id": "eta", "type": "text", "text": eta_text, "font": "large",
         "color": RUNNING_NUMERAL_COLOR, "x": RUNNING_NUMERAL_X, "y": RUNNING_NUMERAL_Y,
         "timeout": timeout_s,
     }
-    elements = [bg_element, title_element, track_element, track_fill_element, numeral_element]
+    if eta_width is not None:
+        numeral_element["width"] = eta_width
+    tip_width = min(2, track_width)
+    tip_element = {
+        "id": "track_tip", "type": "rectangle", "x": track_width - tip_width,
+        "y": RUNNING_TRACK_Y, "width": tip_width, "height": RUNNING_TRACK_HEIGHT,
+        "fill": "solid", "fill_colors": ["#FFFFFFFF"], "border_width": 0, "timeout": timeout_s,
+    }
+    elements = [bg_element, title_element, track_element, track_fill_element, tip_element, numeral_element]
 
     # ETA label (v1.5.1): appended only when _eta_label decides it fits
     # (grammar guard + width check -- see its docstring). This changes
@@ -432,7 +435,7 @@ def _build_running_elements(info: RunningInfo, timeout_s: int, show_spinner: boo
     # for that: main.py's unified shape tracker (frozenset of element
     # ids on whatever was last actually drawn) already detects any shape
     # change and clears first, generically, not just at tier boundaries.
-    label = _eta_label(eta_text)
+    label = _eta_label(eta_text, budget=eta_width or RUNNING_LABEL_BUDGET_PX)
     if label is not None:
         elements.append({
             "id": "eta_label", "type": "text", "text": label, "font": "small",
@@ -443,7 +446,7 @@ def _build_running_elements(info: RunningInfo, timeout_s: int, show_spinner: boo
 
     if show_spinner:
         elements.append({"id": RUN_SPINNER_ID, "type": "animation", "stock_path": SPINNER_STOCK,
-                         "x": 64, "y": 0, "loop": True, "timeout": timeout_s})
+                         "x": 64, "y": 8, "loop": True, "timeout": timeout_s})
     return elements
 
 
@@ -472,14 +475,14 @@ QUOTA_HEADROOM_LOW = "low"
 QUOTA_TRACK_COLOR = "#12241EFF"
 
 QUOTA_BG_GRADIENT = {
-    QUOTA_HEADROOM_HIGH: ["#031F17FF", "#000A08FF"],
-    QUOTA_HEADROOM_MEDIUM: ["#231400FF", "#0A0400FF"],
-    QUOTA_HEADROOM_LOW: ["#2E0509FF", "#0A0101FF"],
+    QUOTA_HEADROOM_HIGH: ["#081B23FF", "#020611FF"],
+    QUOTA_HEADROOM_MEDIUM: ["#211707FF", "#020611FF"],
+    QUOTA_HEADROOM_LOW: ["#240A10FF", "#020611FF"],
 }
 QUOTA_TITLE_COLOR = {
-    QUOTA_HEADROOM_HIGH: "#6FFFCFFF",
-    QUOTA_HEADROOM_MEDIUM: "#FFCB6BFF",
-    QUOTA_HEADROOM_LOW: "#FF6B7AFF",
+    QUOTA_HEADROOM_HIGH: "#FFFFFFFF",
+    QUOTA_HEADROOM_MEDIUM: "#FFFFFFFF",
+    QUOTA_HEADROOM_LOW: "#FFFFFFFF",
 }
 QUOTA_TRACK_FILL_COLOR = {
     QUOTA_HEADROOM_HIGH: "#33FFC1FF",
@@ -494,9 +497,9 @@ QUOTA_NUMERAL_COLOR = {
 
 # Two numerals share the row (percentage remaining on the left, reset-in on
 # the right) -- the only overlay frame that does, since the running badge
-# has just one. No divider element between them (the brief didn't ask for
-# one); RESET_X leaves both enough room for their respective worst cases
-# ("100%" on the left, an hours-form countdown on the right).
+# has just one. A thin accent separator at x=35 makes the split legible;
+# RESET_X leaves both enough room for their respective worst cases ("100%"
+# on the left, an hours-form countdown on the right).
 QUOTA_PCT_X = OVERLAY_TITLE_X   # 2 -- same left margin as every other overlay element
 QUOTA_RESET_X = 40
 
@@ -574,18 +577,15 @@ def _build_quota_elements(info: QuotaInfo, timeout_s: int) -> list[dict]:
         "fill": "gradient_v", "fill_colors": QUOTA_BG_GRADIENT[headroom],
         "border_width": 0, "timeout": timeout_s,
     }
-    title_text = ascii_safe(info.label).upper()
+    title_text = "GQL LEFT" if "GRAPHQL" in info.label.upper() else "REST LEFT"
     title_element = {
         "id": "title", "type": "text", "text": title_text, "font": "small",
         "color": QUOTA_TITLE_COLOR[headroom], "x": OVERLAY_TITLE_X, "y": OVERLAY_TITLE_Y,
-        "width": OVERLAY_TITLE_WIDTH, "timeout": timeout_s,
+        "width": 38, "timeout": timeout_s,
     }
-    if not _title_fits(title_text, OVERLAY_TITLE_WIDTH):
-        title_element.update({
-            "scroll_rate": SCROLL_RATE,
-            "scroll_start_delay": SCROLL_DELAY_MS,
-            "scroll_repeat_delay": SCROLL_DELAY_MS,
-        })
+    reset_label = {"id": "reset_label", "type": "text", "text": "RESET", "font": "small",
+                   "color": "#FFFFFFFF", "x": 45, "y": OVERLAY_TITLE_Y, "width": 25,
+                   "timeout": timeout_s}
     track_element = {
         "id": "track", "type": "rectangle", "x": 0, "y": OVERLAY_TRACK_Y,
         "width": PANEL_WIDTH, "height": OVERLAY_TRACK_HEIGHT, "fill": "solid",
@@ -606,7 +606,12 @@ def _build_quota_elements(info: QuotaInfo, timeout_s: int) -> list[dict]:
         "color": QUOTA_NUMERAL_COLOR[headroom], "x": QUOTA_RESET_X, "y": OVERLAY_NUMERAL_Y,
         "timeout": timeout_s,
     }
-    return [bg_element, title_element, track_element, track_fill_element, pct_element, reset_element]
+    separator = {"id": "quota_separator", "type": "rectangle", "x": 35, "y": 8,
+                 "width": 1, "height": 7, "fill": "solid",
+                 "fill_colors": [QUOTA_TRACK_FILL_COLOR[headroom]], "border_width": 0,
+                 "timeout": timeout_s}
+    return [bg_element, title_element, reset_label, track_element, track_fill_element,
+            pct_element, separator, reset_element]
 
 
 # --- overlay rotation --------------------------------------------------------------
@@ -682,15 +687,16 @@ def build_overlay_payload(descriptor: dict, timeout_s: int, *,
         return {"elements": _build_quota_elements(info, timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_FAIL:
-        text = "CI FAIL " + _fail_line(descriptor["repo"], descriptor["run"])
-        return {"elements": _badge_elements(text, "#A32D2DFF", "#FFFFFFFF", timeout_s),
+        text = ascii_safe(_fail_line(descriptor["repo"], descriptor["run"]))
+        return {"elements": _badge_elements("CI FAIL", text, "#FF7A8AFF", timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_STUCK:
-        text = "CI stuck " + _fail_line(descriptor["repo"], descriptor["run"])
-        return {"elements": _badge_elements(text, "#BA7517FF", "#0B0B0BFF", timeout_s),
+        text = ascii_safe(_fail_line(descriptor["repo"], descriptor["run"]))
+        return {"elements": _badge_elements("CI WAIT", text, "#FFCB6BFF", timeout_s),
                 "priority": PRIORITY_OVERLAY, "led": None}
     if kind == OVERLAY_FRAME_GREEN:
-        return {"elements": [_text_element("CI ok", "#00FF00FF", timeout_s)],
+        return {"elements": _badge_elements("CI OK", "ALL CLEAR", "#6FFFCFFF", timeout_s,
+                                             scroll_body=False),
                 "priority": PRIORITY_OVERLAY, "led": None}
     return None
 
@@ -727,17 +733,26 @@ def _text_element(text: str, color: str, timeout_s: int, font: str = "normal") -
 
 
 def _fail_line(repo: str, fr: FailingRun) -> str:
-    """"owner/repo #42 · workflow" (the ref is dropped when empty)."""
+    """"owner/repo #42 workflow" (the ref is dropped when empty)."""
     ref = f" {fr.ref}" if fr.ref else ""
-    return f"{repo}{ref} · {fr.workflow}"
+    return f"{repo}{ref} {fr.workflow}"
 
 
-def _badge_elements(text: str, bg_color: str, text_color: str, timeout_s: int) -> list[dict]:
-    """Full-panel rounded-rect background + bold scrolling text over it."""
+def _badge_elements(header: str, text: str, accent_color: str, timeout_s: int, *,
+                    scroll_body: bool = True) -> list[dict]:
+    """Two-row CI status card with a fixed header and full context body."""
     # border_width=0: RectangleElement defaults to a 1px white border, which
     # would draw an unwanted white outline around the badge (verified on-device).
     bg = {"id": "bg", "type": "rectangle", "x": 0, "y": 0, "width": 72, "height": 16,
-          "radius": 2, "fill": "solid", "fill_colors": [bg_color], "border_width": 0,
+          "fill": "gradient_v", "fill_colors": ["#111A2BFF", "#020611FF"], "border_width": 0,
           "timeout": timeout_s}
-    return [bg, _text_element(text, text_color, timeout_s, font="bold")]
-
+    header_element = {"id": "ci_header", "type": "text", "text": header, "font": "small",
+                      "color": "#FFFFFFFF", "x": 2, "y": -2, "width": 68, "timeout": timeout_s}
+    rule = {"id": "ci_rule", "type": "rectangle", "x": 12, "y": 6, "width": 58, "height": 1,
+            "fill": "solid", "fill_colors": [accent_color], "border_width": 0, "timeout": timeout_s}
+    body = {"id": "ci", "type": "text", "text": text, "font": "bold", "color": "#FFFFFFFF",
+            "x": 2, "y": 6, "width": 68, "timeout": timeout_s}
+    if scroll_body:
+        body.update({"scroll_rate": 2000, "scroll_start_delay": 1000,
+                     "scroll_repeat_delay": 2000})
+    return [bg, header_element, rule, body]
